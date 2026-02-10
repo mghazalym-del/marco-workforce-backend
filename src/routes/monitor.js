@@ -339,7 +339,7 @@ router.get("/supervisors/:supervisor_id/days", requireAuth, async (req, res) => 
     const rows = await queryMany(
       `
       SELECT
-        a.work_date,
+        a.work_date::date AS work_date,
         $1 AS supervisor_id,
         COUNT(DISTINCT a.employee_id)::int AS workers,
         COUNT(*) FILTER (WHERE a.scan_status='Accepted')::int AS accepted_scans,
@@ -347,14 +347,15 @@ router.get("/supervisors/:supervisor_id/days", requireAuth, async (req, res) => 
         MIN(a.scan_timestamp_server) AS first_activity,
         MAX(a.scan_timestamp_server) AS last_activity
       FROM assignment_scan a
-      JOIN employees e ON e.employee_id = a.employee_id
-      WHERE e.supervisor_employee_id = $1
-        AND a.work_date BETWEEN $2 AND $3
-      GROUP BY a.work_date
-      ORDER BY a.work_date DESC
+      JOIN employees e ON TRIM(UPPER(e.employee_id)) = TRIM(UPPER(a.employee_id))
+      WHERE TRIM(UPPER(e.supervisor_employee_id)) = TRIM(UPPER($1))
+        AND a.work_date::date BETWEEN $2::date AND $3::date
+      GROUP BY a.work_date::date
+      ORDER BY a.work_date::date DESC
       `,
       [supervisorId, from, to]
     );
+
 
     return res.json({
       success: true,
@@ -395,21 +396,21 @@ router.get("/supervisors/:supervisor_id/workers", requireAuth, async (req, res) 
     const rows = await queryMany(
       `
       SELECT
-        e.employee_id,
-        e.full_name,
+        e2.employee_id,
+        e2.full_name,
         COALESCE(wd.day_status, 'NONE') AS day_status
       FROM (
         SELECT DISTINCT a.employee_id
         FROM assignment_scan a
-        JOIN employees e ON e.employee_id = a.employee_id
-        WHERE e.supervisor_employee_id = $1
-          AND a.work_date = $2
+        JOIN employees e ON TRIM(UPPER(e.employee_id)) = TRIM(UPPER(a.employee_id))
+        WHERE TRIM(UPPER(e.supervisor_employee_id)) = TRIM(UPPER($1))
+          AND a.work_date::date = $2::date
       ) x
-      JOIN employees e ON e.employee_id = x.employee_id
+      JOIN employees e2 ON e2.employee_id = x.employee_id
       LEFT JOIN work_day wd
         ON wd.employee_id = x.employee_id
-      AND wd.work_date = $2
-      ORDER BY e.employee_id
+      AND wd.work_date = $2::date
+      ORDER BY e2.employee_id
       `,
       [supervisorId, workDate]
     );
