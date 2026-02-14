@@ -3,6 +3,7 @@ const router = express.Router();
 
 const { pool } = require("../db");
 const requireAuth = require("../middleware/requireAuth");
+const authRequired = requireAuth; // ✅ alias to fix old name
 
 // --- helpers ---
 function normalizeRole(r) {
@@ -163,70 +164,63 @@ router.patch("/employees/:employee_id", requireAuth, requireAdmin, async (req, r
 // GET /api/v1/admin/supervisors
 // (Needed by Desktop Supervisor Control UI)
 // =============================
-router.get("/supervisors", requireAuth, async (req, res) => {
+// GET /api/v1/admin/supervisors
+router.get('/supervisors', authRequired, async (req, res) => {
   try {
-    // Restrict access to Admin or Supervisor accounts
-    // We try to read the employee profile from the token the same way other admin endpoints do.
-    let me = null;
+    const role = (req.user?.role || '').toUpperCase();
+    const myId = req.user?.employee_id;
 
-    // Some codebases attach the authenticated user on req.user.
-    if (req.user && req.user.employee_id) {
-      me = req.user;
-    } else {
-      // Fallback: look up the employee based on token payload (requireAuth should have already validated it).
-      // If requireAuth does not populate req.user, we use the Authorization header token as-is.
-      const auth = req.headers.authorization || "";
-      const token = auth.startsWith("Bearer ") ? auth.slice(7) : auth;
-
-      // Tokens in this project are DEV-TOKEN-<EMP_ID>
-      const m = /^DEV-TOKEN-(.+)$/.exec(token || "");
-      const employeeId = m ? m[1] : null;
-
-      if (employeeId) {
-        const r = await pool.query(
-          `SELECT employee_id, full_name, role, status, is_supervisor, supervisor_employee_id, position_title
-             FROM employees
-            WHERE employee_id=$1
-            LIMIT 1`,
-          [employeeId]
-        );
-        me = r.rows[0] || null;
-      }
+    if (!myId) {
+      return res.status(401).json({ success: false, error: { code: 'UNAUTHORIZED', message: 'Missing user' } });
     }
 
-    if (!me) {
-      return res.status(401).json({
-        success: false,
-        error: { code: "UNAUTHORIZED", message: "Unauthorized" },
-      });
+    let rows = [];
+
+    // ADMIN: all supervisors
+    if (role === 'ADMIN') {
+      rows = await db.any(`
+        SELECT employee_id, full_name, role, supervisor_employee_id
+        FROM employees
+        WHERE role IN ('ADMIN','SUPERVISOR') OR is_supervisor = true
+        ORDER BY employee_id
+      `);
     }
 
-    const role = String(me.role || "").toUpperCase();
-    const isSup = !!me.is_supervisor;
-    if (!(role === "ADMIN" || role === "SUPERVISOR" || isSup)) {
-      return res.status(403).json({
-        success: false,
-        error: { code: "FORBIDDEN", message: "Forbidden" },
-      });
+    // SE: supervisors directly under this SE
+    else if (role === 'SE') {
+      rows = await db.any(`
+        SELECT employee_id, full_name, role, supervisor_employee_id
+        FROM employees
+        WHERE role IN ('ADMIN','SUPERVISOR') OR is_supervisor = true
+          AND supervisor_employee_id = $1
+        ORDER BY employee_id
+      `, [myId]);
     }
 
-    const q = await pool.query(
-      `SELECT employee_id, full_name, role, status, is_supervisor, supervisor_employee_id, position_title
-         FROM employees
-        WHERE COALESCE(is_supervisor,false) = true
-           OR UPPER(COALESCE(role,'')) IN ('SUPERVISOR','ADMIN')
-        ORDER BY employee_id`
-    );
+    // PM: supervisors under any SE under this PM (PM -> SE -> Supervisor)
+    else if (role === 'PM') {
+      rows = await db.any(`
+        SELECT s.employee_id, s.full_name, s.role, s.supervisor_employee_id
+        FROM employees s
+        WHERE (s.role IN ('ADMIN','SUPERVISOR') OR s.is_supervisor = true)
+          AND s.supervisor_employee_id IN (
+            SELECT employee_id FROM employees
+            WHERE role = 'SE' AND supervisor_employee_id = $1
+          )
+        ORDER BY s.employee_id
+      `, [myId]);
+    }
 
-    return res.json({ success: true, data: { supervisors: q.rows } });
+    else {
+      return res.status(403).json({ success: false, error: { code: 'FORBIDDEN', message: 'Forbidden' } });
+    }
+
+    return res.json({ success: true, data: { supervisors: rows } });
   } catch (e) {
-    console.error("[ADMIN] list supervisors:", e);
-    return res.status(500).json({
-      success: false,
-      error: { code: "SERVER_ERROR", message: "Unexpected error" },
-    });
+    return res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: e.message } });
   }
 });
+
 
 console.log("[ADMIN ROUTES] loaded from:", __filename);
 

@@ -25,6 +25,10 @@ try {
 const app = express();
 console.log("[BOOT] index.js loaded from:", __filename);
 
+const seRoutes = require("./routes/se");
+app.use("/api/v1/se", seRoutes);
+
+
 // monitoring route (for uptime monitors)
 app.use("/api/v1/monitor", require("./routes/monitor"));
 
