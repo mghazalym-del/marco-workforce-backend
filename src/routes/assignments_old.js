@@ -29,86 +29,26 @@ async function getEmployeeRole(employeeId) {
   return (r.rows[0]?.role || "WORKER").toString().toUpperCase();
 }
 
-
-async function isAncestor(ancestorId, employeeId) {
-  // Returns true if ancestorId is in the supervisor chain of employeeId (including self).
-  const q = await pool.query(
-    `
-    WITH RECURSIVE up AS (
-      SELECT employee_id, supervisor_employee_id
-      FROM employees
-      WHERE employee_id = $2
-      UNION ALL
-      SELECT e.employee_id, e.supervisor_employee_id
-      FROM employees e
-      JOIN up u ON e.employee_id = u.supervisor_employee_id
-      WHERE u.supervisor_employee_id IS NOT NULL
-    )
-    SELECT 1 AS ok FROM up WHERE employee_id = $1 LIMIT 1
-    `,
-    [ancestorId, employeeId]
-  );
-  return q.rows.length > 0;
-}
-
-function requireCanViewEmployeeParam(paramName) {
-  return async (req, res, next) => {
+function requireSupervisorOrAdmin(req, res, next) {
+  (async () => {
     try {
-      const requesterId = req.employee_id;
-      const targetId = (req.params[paramName] || "").toString();
-
-      if (!requesterId || !targetId) {
-        return res.status(400).json({
+      const role = await getEmployeeRole(req.employee_id);
+      // In MARCO Workforce you currently use ADMIN as supervisor user too.
+      if (role !== "ADMIN" && role !== "SUPERVISOR") {
+        return res.status(403).json({
           success: false,
-          error: { code: "BAD_REQUEST", message: "Missing employee id" },
+          error: { code: "FORBIDDEN", message: "Supervisor/Admin only" },
         });
       }
-
-      const role = await getEmployeeRole(requesterId);
-
-      // WORKER can only view self
-      if (role === "WORKER") {
-        if (requesterId !== targetId) {
-          return res.status(403).json({
-            success: false,
-            error: { code: "FORBIDDEN", message: "Forbidden" },
-          });
-        }
-        return next();
-      }
-
-      // ADMIN can view anyone
-      if (role === "ADMIN") return next();
-
-      // SUPERVISOR / SE / PM can view employees in their reporting chain
-      if (role === "SUPERVISOR" || role === "SE" || role === "PM") {
-        const ok = await isAncestor(requesterId, targetId);
-        if (!ok) {
-          return res.status(403).json({
-            success: false,
-            error: { code: "FORBIDDEN", message: "Forbidden" },
-          });
-        }
-        return next();
-      }
-
-      // default deny
-      return res.status(403).json({
-        success: false,
-        error: { code: "FORBIDDEN", message: "Forbidden" },
-      });
+      req.role = role;
+      next();
     } catch (e) {
-      console.error("requireCanViewEmployeeParam error", e);
-      return res.status(500).json({
-        success: false,
-        error: { code: "SERVER_ERROR", message: "Internal error" },
-      });
+      next(e);
     }
-  };
+  })();
 }
 
 // ---------------- WORKER: DAY DETAILS ----------------
-
 router.get("/day", devAuth, async (req, res, next) => {
   try {
     const { work_date } = req.query;
@@ -221,7 +161,7 @@ router.get("/day/summary", devAuth, async (req, res, next) => {
 
 // ---------------- SUPERVISOR/ADMIN: DAY SUMMARY FOR ANY WORKER ----------------
 // GET /api/v1/assignments/day/summary/:employee_id?work_date=YYYY-MM-DD
-router.get("/day/summary/:employee_id", devAuth, requireCanViewEmployeeParam("employee_id"), async (req, res, next) => {
+router.get("/day/summary/:employee_id", devAuth, requireSupervisorOrAdmin, async (req, res, next) => {
   try {
     const { work_date } = req.query;
     const employeeId = req.params.employee_id;

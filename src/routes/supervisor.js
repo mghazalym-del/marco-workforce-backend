@@ -783,6 +783,79 @@ router.post("/finalize-supervisor-day", requireAuth, async (req, res) => {
     return res.status(status).json(e.payload || { success: false, error: e.message || "Unexpected error" });
   }
 });
+/**
+ * POST /api/v1/supervisor/return-supervisor-day
+ * SE/PM action: return ALL worker days under a supervisor back to OPEN (unless FINALIZED).
+ * Body: { supervisor_id, work_date, reason? }
+ */
+router.post("/return-supervisor-day", requireAuth, async (req, res) => {
+  const decidedBy = req.employee_id || employeeIdFromAuth(req);
+  const supervisorId = req.body?.supervisor_id;
+  const workDate = req.body?.work_date;
+  const reason = req.body?.reason || null;
+
+  if (!decidedBy) return res.status(401).json({ success: false, error: "Unauthorized" });
+  if (!supervisorId || !workDate) {
+    return res.status(400).json({
+      success: false,
+      error: { code: "BAD_REQUEST", message: "supervisor_id and work_date are required" },
+    });
+  }
+
+  try {
+    const result = await withClient(async (client) => {
+      const q = (t, p) => client.query(t, p);
+
+      // workers who had supervisor-assigned scans that day (same logic as finalize-supervisor-day)
+      const w = await q(
+        `SELECT DISTINCT employee_id
+         FROM assignment_scan
+         WHERE supervisor_employee_id = $1 AND work_date = $2`,
+        [supervisorId, workDate]
+      );
+      const workers = w.rows.map((r) => String(r.employee_id));
+
+      const reopened = [];
+      const skipped = [];
+
+      for (const empId of workers) {
+        const wd = await ensureWorkDay(q, empId, workDate);
+        const st = String(wd.day_status).toUpperCase();
+
+        if (st === "FINALIZED") {
+          skipped.push({ employee_id: empId, reason: "FINALIZED" });
+          continue;
+        }
+
+        // Return day back to OPEN
+        await q(
+          `UPDATE work_day
+           SET day_status='OPEN',
+               reopened_at = NOW(),
+               reopened_by = $3
+           WHERE employee_id=$1 AND work_date=$2`,
+          [empId, workDate, decidedBy]
+        );
+
+        reopened.push(empId);
+      }
+
+      return {
+        supervisor_id: supervisorId,
+        work_date: workDate,
+        workers_count: workers.length,
+        reopened,
+        skipped,
+        reason,
+      };
+    });
+
+    return res.json({ success: true, data: result });
+  } catch (e) {
+    const status = e.httpStatus || 500;
+    return res.status(status).json(e.payload || { success: false, error: e.message || "Unexpected error" });
+  }
+});
 
 
 module.exports = router;
