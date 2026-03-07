@@ -162,7 +162,7 @@ router.get("/supervisors", requireAuth, async (req, res) => {
 // ----------------------------------------------------------
 // POST /api/v1/se/supervisors/:supervisorId/return-day
 //   ?work_date=YYYY-MM-DD
-// returns CLOSED worker-days to RETURNED for that supervisor
+// returns CLOSED worker-days back to OPEN for that supervisor
 // ----------------------------------------------------------
 router.post("/supervisors/:supervisorId/return-day", requireAuth, async (req, res) => {
   if (!requireSE(req, res)) return;
@@ -182,16 +182,18 @@ router.post("/supervisors/:supervisorId/return-day", requireAuth, async (req, re
       const workers = await getWorkersForSupervisor(client, supervisorId);
       const workerIds = workers.map((w) => w.employee_id);
 
-      // Return means: CLOSED -> RETURNED (do NOT touch FINALIZED)
+      // Return means: CLOSED -> OPEN (do NOT touch FINALIZED)
       const upd = `
         UPDATE work_day
-        SET day_status = 'RETURNED'
+        SET day_status = 'OPEN',
+            reopened_at = NOW(),
+            reopened_by = $3
         WHERE employee_id = ANY($1)
           AND work_date = $2::date
           AND day_status = 'CLOSED'
         RETURNING employee_id, work_date, day_status
       `;
-      const r = await client.query(upd, [workerIds, workDate]);
+      const r = await client.query(upd, [workerIds, workDate, seId]);
 
       return {
         se_id: seId,
@@ -295,7 +297,7 @@ try {
 }
 
 // ------------------------------------------------------------------
-// Worker-level: return ONE worker day to RETURNED (SE -> Supervisor)
+// Worker-level: return ONE worker day back to OPEN (SE -> Supervisor)
 // POST /api/v1/se/supervisors/:supervisorId/workers/:workerId/return-day?work_date=YYYY-MM-DD
 // ------------------------------------------------------------------
 router.post(
@@ -335,13 +337,15 @@ router.post(
         const upd = await client.query(
           `
           UPDATE work_day
-          SET day_status='RETURNED'
+          SET day_status='OPEN',
+              reopened_at=NOW(),
+              reopened_by=$3
           WHERE employee_id=$1
             AND work_date=$2::date
             AND day_status='CLOSED'
           RETURNING employee_id, work_date, day_status
           `,
-          [workerId, workDate]
+          [workerId, workDate, seId]
         );
 
         return {

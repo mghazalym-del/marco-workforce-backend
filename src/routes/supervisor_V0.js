@@ -328,9 +328,7 @@ router.post("/assign/scan", requireAuth, async (req, res) => {
       
 
       // Hard lock: once FINALIZED by Site Engineer, the day cannot be reopened or modified
-      const dayStatus = String(wd.day_status || "").toUpperCase();
-
-      if (dayStatus === "FINALIZED") {
+      if (String(wd.day_status).toUpperCase() === "FINALIZED") {
         const err = new Error("DAY_FINALIZED_LOCKED");
         err.httpStatus = 409;
         err.payload = {
@@ -339,41 +337,26 @@ router.post("/assign/scan", requireAuth, async (req, res) => {
             code: "DAY_FINALIZED_LOCKED",
             message: `This day is FINALIZED and cannot be reopened or modified for ${workDate}.`,
           },
-          data: { worker_employee_id: workerEmployeeId, work_date: workDate, day_status: wd.day_status },
+          data: { worker_employee_id: workerEmployeeId, work_date: workDate },
         };
         throw err;
       }
-
-      if (dayStatus === "RETURNED" && !reopenDay) {
-        const err = new Error("DAY_RETURNED_CONFIRM");
+if (String(wd.day_status).toUpperCase() === "CLOSED" && !reopenDay) {
+        const err = new Error("DAY_CLOSED_CONFIRM");
         err.httpStatus = 409;
         err.payload = {
           success: false,
           error: {
-            code: "DAY_RETURNED_CONFIRM",
-            message: `This worker day was RETURNED by Site Engineer for ${workDate}. If you continue, the system will re-open the day and assign the new task.`,
+            code: "DAY_CLOSED_CONFIRM",
+            message: `This worker already closed the day for ${workDate}. If you continue, the system will re-open the day and assign the new task.`,
           },
-          data: { worker_employee_id: workerEmployeeId, work_date: workDate, day_status: wd.day_status },
+          data: { worker_employee_id: workerEmployeeId, work_date: workDate },
         };
         throw err;
       }
 
-      if (dayStatus === "RETURNED" && reopenDay) {
+      if (String(wd.day_status).toUpperCase() === "CLOSED" && reopenDay) {
         await setWorkDayStatus(q, workerEmployeeId, workDate, "OPEN", supervisorId);
-      }
-
-      if (dayStatus === "CLOSED") {
-        const err = new Error("DAY_CLOSED_LOCKED");
-        err.httpStatus = 409;
-        err.payload = {
-          success: false,
-          error: {
-            code: "DAY_CLOSED_LOCKED",
-            message: `This worker day is CLOSED for ${workDate}. Only a RETURNED day can be reopened for correction.`,
-          },
-          data: { worker_employee_id: workerEmployeeId, work_date: workDate, day_status: wd.day_status },
-        };
-        throw err;
       }
 
       // Ensure assignment_day exists
