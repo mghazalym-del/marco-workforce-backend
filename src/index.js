@@ -13,6 +13,8 @@ const assignmentsRoutes = require("./routes/assignments");
 const supervisorRoutes = require("./routes/supervisor");
 const dayRoutes = require("./routes/day");
 const adminRoutes = require("./routes/admin");
+const taskReleasesRoutes = require("./routes/taskReleases");
+
 console.log("[MOUNT] adminRoutes loaded OK:", typeof adminRoutes);
 
 // Optional background jobs folder exists, but do not fail if job module not present.
@@ -20,14 +22,15 @@ let startAutoCloseJob = null;
 try {
   // if you have a job file, it can export a start(pool) function; otherwise ignored
   startAutoCloseJob = require("./jobs/autoCloseJob");
-} catch (_) { /* ignore */ }
+} catch (_) {
+  /* ignore */
+}
 
 const app = express();
 console.log("[BOOT] index.js loaded from:", __filename);
 
 const seRoutes = require("./routes/se");
 app.use("/api/v1/se", seRoutes);
-
 
 // monitoring route (for uptime monitors)
 app.use("/api/v1/monitor", require("./routes/monitor"));
@@ -48,9 +51,7 @@ app.use((req, _res, next) => {
 app.get("/health", (_req, res) => res.json({ ok: true }));
 app.get("/api/v1/health", (_req, res) => res.json({ ok: true }));
 
-// Project
-
-
+// Project / admin / work item routes
 console.log("[MOUNT] /api/v1/admin mounted");
 dumpRoutes(app);
 app.use("/api/v1/admin", adminRoutes);
@@ -73,8 +74,9 @@ app.use("/api/v1/approvals", approvalsRoutes);
 app.use("/api/v1/assignments", assignmentsRoutes);
 app.use("/api/v1/supervisor", supervisorRoutes);
 app.use("/api/v1/day", dayRoutes);
-//app.use("/api/v1/admin", require("./routes/admin"));
 
+// ✅ Phase 3.0 – Task Release Governance
+app.use("/api/v1/task-releases", taskReleasesRoutes);
 
 // JSON 404 for API
 app.use("/api/v1", (req, res) => {
@@ -97,7 +99,6 @@ app.use((err, _req, res, _next) => {
   });
 });
 
-
 function dumpRoutes(app) {
   try {
     const router = app._router || app.router; // Express 4 vs Express 5
@@ -117,7 +118,13 @@ function dumpRoutes(app) {
           if (h?.route?.path) {
             const methods = Object.keys(h.route.methods || {}).join(",").toUpperCase();
             const line = `${methods} ${base} -> ${h.route.path}`;
-            if (line.includes("admin") || line.includes("supervis")) console.log(line);
+            if (
+              line.includes("admin") ||
+              line.includes("supervis") ||
+              line.includes("task-releases")
+            ) {
+              console.log(line);
+            }
           }
         }
       }
@@ -126,7 +133,13 @@ function dumpRoutes(app) {
       if (layer?.route?.path) {
         const methods = Object.keys(layer.route.methods || {}).join(",").toUpperCase();
         const line = `${methods} ${layer.route.path}`;
-        if (line.includes("admin") || line.includes("supervis")) console.log(line);
+        if (
+          line.includes("admin") ||
+          line.includes("supervis") ||
+          line.includes("task-releases")
+        ) {
+          console.log(line);
+        }
       }
     }
     console.log("===== ROUTE DUMP END =====");
@@ -134,7 +147,6 @@ function dumpRoutes(app) {
     console.log("dumpRoutes failed:", e?.message || e);
   }
 }
-
 
 const PORT = process.env.PORT || 3000;
 
@@ -152,6 +164,7 @@ app.listen(PORT, () => {
     console.warn("Auto-close job not started:", e?.message || e);
   }
 });
+
 console.log("BOOT OK:", __filename, "CWD:", process.cwd());
 
 module.exports = app;

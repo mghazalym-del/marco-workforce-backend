@@ -1,20 +1,27 @@
 /**
- * MARCO Workforce - scans.js (auth fix + compatibility)
+ * MARCO Workforce - scans.js
  *
- * Fixes:
- * - employee_id was undefined because requireAuth attaches user info on req.user (not req.employee_id)
- * - Adds safe employeeIdFromAuth(req) + DEV-TOKEN fallback (Bearer DEV-TOKEN-E1001)
- * - Accepts body.items OR body.scans; parses req.body if it's a string
- * - Removes work_day created_at/updated_at usage (schema mismatch)
+ * Current behavior kept:
+ * - auth via requireAuth
+ * - DEV-TOKEN fallback
+ * - accepts body.items OR body.scans
+ * - duplicate check
+ * - >3 tasks/day => PendingApproval
+ * - rebuild task sessions for accepted scans
+ * - day closed check
  *
- * Business logic unchanged.
+ * Phase 3.0 addition:
+ * - validate task_releases before allowing scan
+ * - worker can only scan a task released to their supervisor team
+ * - support secure QR format: MARCO|RLS|<release_id>
+ * - keep old QR format working: project|task
+ * - enforce max_workers capacity from task_releases
  */
+
 const express = require("express");
 const router = express.Router();
 
 const { pool } = require("../db");
-
-// IMPORTANT: keep using your existing middleware path/name
 const requireAuth = require("../middleware/requireAuth");
 
 // ---- Auth helpers ----
@@ -41,13 +48,33 @@ function parseQrFlexible(qr) {
   if (typeof qr !== "string") return null;
   const s = qr.trim();
   if (!s) return null;
-  const delim = s.includes("|") ? "|" : s.includes("/") ? "/" : null;
-  if (!delim) return null;
-  const parts = s.split(delim).map((x) => x.trim());
-  if (parts.length !== 2) return null;
-  const [project_id, task_id] = parts;
-  if (!project_id || !task_id) return null;
-  return { project_id, task_id };
+
+  const parts = s.split("|").map((x) => x.trim());
+
+  // NEW secure QR format: MARCO|RLS|release_id
+  if (parts.length === 3 && parts[0] === "MARCO" && parts[1] === "RLS") {
+    if (!parts[2]) return null;
+    return { release_id: parts[2] };
+  }
+
+  // OLD QR fallback: project_id|task_id
+  if (parts.length === 2) {
+    const [project_id, task_id] = parts;
+    if (!project_id || !task_id) return null;
+    return { project_id, task_id };
+  }
+
+  // optional slash fallback
+  if (s.includes("/")) {
+    const slashParts = s.split("/").map((x) => x.trim());
+    if (slashParts.length === 2) {
+      const [project_id, task_id] = slashParts;
+      if (!project_id || !task_id) return null;
+      return { project_id, task_id };
+    }
+  }
+
+  return null;
 }
 
 // --- DB helpers ---
@@ -97,6 +124,92 @@ async function acceptedCountForDay(client, employeeId, workDate) {
        FROM assignment_scan
       WHERE employee_id=$1 AND work_date=$2 AND scan_status='Accepted'`,
     [employeeId, workDate]
+  );
+  return r.rows[0]?.c ?? 0;
+}
+
+async function getWorkerSupervisorId(client, employeeId) {
+  const r = await client.query(
+    `
+    SELECT supervisor_employee_id
+    FROM employees
+    WHERE employee_id = $1
+    LIMIT 1
+    `,
+    [employeeId]
+  );
+
+  if (r.rowCount === 0) return null;
+  return r.rows[0]?.supervisor_employee_id || null;
+}
+
+async function findActiveReleaseForSupervisor(client, projectId, taskId, supervisorEmployeeId) {
+  if (!supervisorEmployeeId) return null;
+
+  const r = await client.query(
+    `
+    SELECT
+      release_id,
+      project_id,
+      task_id,
+      se_employee_id,
+      supervisor_employee_id,
+      release_status,
+      released_at,
+      released_by,
+      min_workers,
+      max_workers
+    FROM task_releases
+    WHERE project_id = $1
+      AND task_id = $2
+      AND supervisor_employee_id = $3
+      AND release_status = 'ACTIVE'
+    ORDER BY released_at DESC
+    LIMIT 1
+    `,
+    [projectId, taskId, supervisorEmployeeId]
+  );
+
+  return r.rowCount > 0 ? r.rows[0] : null;
+}
+
+async function findReleaseById(client, releaseId) {
+  if (!releaseId) return null;
+
+  const r = await client.query(
+    `
+    SELECT
+      release_id,
+      project_id,
+      task_id,
+      se_employee_id,
+      supervisor_employee_id,
+      release_status,
+      released_at,
+      released_by,
+      min_workers,
+      max_workers
+    FROM task_releases
+    WHERE release_id = $1
+    LIMIT 1
+    `,
+    [releaseId]
+  );
+
+  return r.rowCount > 0 ? r.rows[0] : null;
+}
+
+async function currentOpenWorkersForTask(client, projectId, taskId, workDate) {
+  const r = await client.query(
+    `
+    SELECT COUNT(DISTINCT employee_id)::int AS c
+    FROM task_session
+    WHERE project_id = $1
+      AND task_id = $2
+      AND work_date = $3
+      AND status = 'OPEN'
+    `,
+    [projectId, taskId, workDate]
   );
   return r.rows[0]?.c ?? 0;
 }
@@ -152,7 +265,6 @@ async function rebuildTaskSessionsForDay(client, employeeId, workDate) {
   }
 }
 
-
 // --- Route ---
 router.post("/batch", requireAuth, async (req, res) => {
   const employeeId = employeeIdFromAuth(req);
@@ -162,7 +274,9 @@ router.post("/batch", requireAuth, async (req, res) => {
     // Robust body parsing
     let b = req.body;
     if (typeof b === "string") {
-      try { b = JSON.parse(b); } catch (_) {}
+      try {
+        b = JSON.parse(b);
+      } catch (_) {}
     }
     if (!b || typeof b !== "object") b = {};
 
@@ -176,18 +290,26 @@ router.post("/batch", requireAuth, async (req, res) => {
     const deviceId = b.device_id || b.deviceId || "unknown";
     const workDateTop = b.work_date || b.workDate || null;
 
+    // IMPORTANT:
+    // do NOT use await here. We only parse/store raw values.
     const scans = rawItems
       .map((it) => {
         if (!it || typeof it !== "object") return null;
 
         let projectId = it.project_id || it.projectId || null;
         let taskId = it.task_id || it.taskId || null;
+        let releaseId = null;
 
-        if ((!projectId || !taskId) && it.qr) {
+        if (it.qr) {
           const parsed = parseQrFlexible(String(it.qr));
           if (parsed) {
-            projectId = parsed.project_id;
-            taskId = parsed.task_id;
+            if (parsed.release_id) {
+              releaseId = parsed.release_id;
+            }
+            if (parsed.project_id && parsed.task_id) {
+              projectId = parsed.project_id;
+              taskId = parsed.task_id;
+            }
           }
         }
 
@@ -206,15 +328,18 @@ router.post("/batch", requireAuth, async (req, res) => {
 
         const isOffline = it.is_offline === true || it.is_offline === 1;
 
-        if (!projectId || !taskId || !workDate) return null;
+        // For secure QR, project/task may be resolved later from releaseId.
+        if (!workDate) return null;
+        if (!releaseId && (!projectId || !taskId)) return null;
 
         return {
           client_reference_id:
             clientRef ||
-            `${employeeId || "unknown"}-${workDate}-${projectId}-${taskId}-${Date.now()}`,
+            `${employeeId || "unknown"}-${workDate}-${projectId || "release"}-${taskId || releaseId}-${Date.now()}`,
           work_date: workDate,
-          project_id: String(projectId),
-          task_id: String(taskId),
+          project_id: projectId ? String(projectId) : null,
+          task_id: taskId ? String(taskId) : null,
+          release_id: releaseId ? String(releaseId) : null,
           scan_timestamp_device: ts,
           is_offline: !!isOffline,
           qr: it.qr ? String(it.qr) : `${projectId}|${taskId}`,
@@ -267,9 +392,139 @@ router.post("/batch", requireAuth, async (req, res) => {
         });
       }
 
+      const workerSupervisorId = await getWorkerSupervisorId(client, employeeId);
+      if (!workerSupervisorId) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          success: false,
+          error: {
+            code: "SUPERVISOR_NOT_FOUND",
+            message: "Worker has no supervisor assigned.",
+          },
+          data: { employee_id: employeeId },
+        });
+      }
+
       const assignmentDayId = await getOrCreateAssignmentDay(client, employeeId, batchWorkDate);
 
       for (const s of scans) {
+        let activeRelease = null;
+
+        // NEW secure QR flow:
+        // If release_id was scanned, resolve exact release here.
+        if (s.release_id) {
+          const rel = await findReleaseById(client, s.release_id);
+
+          if (!rel) {
+            results.push({
+              client_reference_id: s.client_reference_id,
+              qr: s.qr,
+              status: "Rejected",
+              error: {
+                code: "INVALID_RELEASE",
+                message: "QR release not found.",
+              },
+            });
+            continue;
+          }
+
+          if (String(rel.release_status || "").toUpperCase() !== "ACTIVE") {
+            results.push({
+              client_reference_id: s.client_reference_id,
+              qr: s.qr,
+              status: "Rejected",
+              error: {
+                code: "RELEASE_INACTIVE",
+                message: "Task release is not active.",
+              },
+            });
+            continue;
+          }
+
+          if (String(rel.supervisor_employee_id || "") !== String(workerSupervisorId)) {
+            results.push({
+              client_reference_id: s.client_reference_id,
+              qr: s.qr,
+              status: "Rejected",
+              error: {
+                code: "TASK_NOT_RELEASED",
+                message: "Task not released for your team.",
+              },
+            });
+            continue;
+          }
+
+          s.project_id = rel.project_id;
+          s.task_id = rel.task_id;
+          activeRelease = rel;
+        } else {
+          // OLD QR flow
+          activeRelease = await findActiveReleaseForSupervisor(
+            client,
+            s.project_id,
+            s.task_id,
+            workerSupervisorId
+          );
+
+          if (!activeRelease) {
+            results.push({
+              client_reference_id: s.client_reference_id,
+              qr: s.qr,
+              status: "Rejected",
+              error: {
+                code: "TASK_NOT_RELEASED",
+                message: "Task not released for your team.",
+              },
+            });
+            continue;
+          }
+        }
+
+        if (!s.project_id || !s.task_id) {
+          results.push({
+            client_reference_id: s.client_reference_id,
+            qr: s.qr,
+            status: "Rejected",
+            error: {
+              code: "INVALID_QR",
+              message: "QR does not contain a valid task reference.",
+            },
+          });
+          continue;
+        }
+
+        // Capacity enforcement
+        const maxWorkers =
+          activeRelease.max_workers === null || activeRelease.max_workers === undefined
+            ? null
+            : Number(activeRelease.max_workers);
+
+        if (maxWorkers !== null && Number.isFinite(maxWorkers)) {
+          const currentWorkers = await currentOpenWorkersForTask(
+            client,
+            s.project_id,
+            s.task_id,
+            s.work_date
+          );
+
+          if (currentWorkers >= maxWorkers) {
+            results.push({
+              client_reference_id: s.client_reference_id,
+              qr: s.qr,
+              status: "Rejected",
+              error: {
+                code: "CAPACITY_REACHED",
+                message: `Task capacity reached (${currentWorkers}/${maxWorkers}). Contact your supervisor.`,
+              },
+              release_id: activeRelease.release_id,
+              current_workers: currentWorkers,
+              min_workers: activeRelease.min_workers ?? 0,
+              max_workers: maxWorkers,
+            });
+            continue;
+          }
+        }
+
         const dup = await isDuplicateScan(client, employeeId, s.work_date, s.project_id, s.task_id);
         if (dup) {
           results.push({
@@ -296,23 +551,25 @@ router.post("/batch", requireAuth, async (req, res) => {
                approval_type, employee_id, supervisor_employee_id,
                assignment_day_id, status, requested_payload, created_at, updated_at
              )
-             VALUES ('Over3Tasks', $1, NULL, $2, 'Submitted', $3::jsonb, NOW(), NOW())
+             VALUES ('Over3Tasks', $1, $2, $3, 'Submitted', $4::jsonb, NOW(), NOW())
              RETURNING approval_id`,
             [
               employeeId,
+              workerSupervisorId,
               assignmentDayId,
               JSON.stringify({
                 work_date: s.work_date,
                 project_id: s.project_id,
                 task_id: s.task_id,
                 via: "WorkerScan",
+                release_id: activeRelease.release_id,
+                supervisor_employee_id: workerSupervisorId,
               }),
             ]
           );
           approvalId = ai.rows[0].approval_id;
         }
 
-        // ✅ FIX: include client_reference_id in INSERT (your DB requires it NOT NULL)
         const ins = await client.query(
           `INSERT INTO assignment_scan (
              client_reference_id,
@@ -335,7 +592,6 @@ router.post("/batch", requireAuth, async (req, res) => {
           ]
         );
 
-        // ✅ Small safe improvement: store scan_id inside approval payload (helps approval decision find the scan)
         if (approvalId) {
           await client.query(
             `UPDATE approval_item
@@ -358,6 +614,10 @@ router.post("/batch", requireAuth, async (req, res) => {
           note,
           scan_id: ins.rows[0].scan_id,
           approval_id: approvalId,
+          release_id: activeRelease.release_id,
+          supervisor_employee_id: workerSupervisorId,
+          min_workers: activeRelease.min_workers ?? 0,
+          max_workers: activeRelease.max_workers ?? null,
         });
       }
 
@@ -372,13 +632,13 @@ router.post("/batch", requireAuth, async (req, res) => {
     } finally {
       client.release();
     }
-   return res.json({
-    success: true,
-    data: {
-      results,
-    },
-  });
 
+    return res.json({
+      success: true,
+      data: {
+        results,
+      },
+    });
   } catch (e) {
     console.error("[SCANS] fatal:", e);
     return res.status(500).json({
