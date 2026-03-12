@@ -172,7 +172,7 @@ router.post("/:approval_id/decision", devAuth, async (req, res) => {
     const payload = getPayload(appr);
 
     // ----- Over3Tasks -----
-    if (approvalType === "Over3Tasks") {
+    if (approvalType === "Over3Tasks" || approvalType === "RepeatTaskSameDay") {
       // ✅ FIX: use related_scan_id OR fallback to payload.scan_id
       const scanId =
         appr.related_scan_id ||

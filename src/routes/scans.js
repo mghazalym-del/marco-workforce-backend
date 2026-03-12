@@ -5,17 +5,18 @@
  * - auth via requireAuth
  * - DEV-TOKEN fallback
  * - accepts body.items OR body.scans
- * - duplicate check
  * - >3 tasks/day => PendingApproval
  * - rebuild task sessions for accepted scans
  * - day closed check
  *
- * Phase 3.0 addition:
+ * Updated behavior:
  * - validate task_releases before allowing scan
  * - worker can only scan a task released to their supervisor team
- * - support secure QR format: MARCO|RLS|<release_id>
- * - keep old QR format working: project|task
+ * - support ONLY secure QR format: release_id|work_date
  * - enforce max_workers capacity from task_releases
+ * - duplicate same task same day:
+ *    * if same task is still OPEN -> reject
+ *    * if same task was CLOSED already -> PendingApproval
  */
 
 const express = require("express");
@@ -35,7 +36,6 @@ function employeeIdFromAuth(req) {
 
   if (direct) return String(direct);
 
-  // DEV token fallback: "Bearer DEV-TOKEN-E1001"
   const h = req.headers.authorization || "";
   const m = h.match(/Bearer\s+DEV-TOKEN-([A-Za-z0-9_-]+)/i);
   if (m && m[1]) return String(m[1]);
@@ -51,27 +51,11 @@ function parseQrFlexible(qr) {
 
   const parts = s.split("|").map((x) => x.trim());
 
-  // NEW secure QR format: MARCO|RLS|release_id
-  if (parts.length === 3 && parts[0] === "MARCO" && parts[1] === "RLS") {
-    if (!parts[2]) return null;
-    return { release_id: parts[2] };
-  }
-
-  // OLD QR fallback: project_id|task_id
+  // ONLY supported QR format: release_id|work_date
   if (parts.length === 2) {
-    const [project_id, task_id] = parts;
-    if (!project_id || !task_id) return null;
-    return { project_id, task_id };
-  }
-
-  // optional slash fallback
-  if (s.includes("/")) {
-    const slashParts = s.split("/").map((x) => x.trim());
-    if (slashParts.length === 2) {
-      const [project_id, task_id] = slashParts;
-      if (!project_id || !task_id) return null;
-      return { project_id, task_id };
-    }
+    const [release_id, qr_date] = parts;
+    if (!release_id || !qr_date) return null;
+    return { release_id, qr_date };
   }
 
   return null;
@@ -104,18 +88,6 @@ async function getOrCreateAssignmentDay(client, employeeId, workDate) {
     [employeeId, workDate]
   );
   return ins.rows[0].assignment_day_id;
-}
-
-async function isDuplicateScan(client, employeeId, workDate, projectId, taskId) {
-  const r = await client.query(
-    `SELECT 1
-       FROM assignment_scan
-      WHERE employee_id=$1 AND work_date=$2 AND project_id=$3 AND task_id=$4
-        AND scan_status <> 'Rejected'
-      LIMIT 1`,
-    [employeeId, workDate, projectId, taskId]
-  );
-  return r.rowCount > 0;
 }
 
 async function acceptedCountForDay(client, employeeId, workDate) {
@@ -214,11 +186,39 @@ async function currentOpenWorkersForTask(client, projectId, taskId, workDate) {
   return r.rows[0]?.c ?? 0;
 }
 
+async function getSameTaskHistory(client, employeeId, workDate, projectId, taskId) {
+  const scansR = await client.query(
+    `SELECT COUNT(*)::int AS c
+       FROM assignment_scan
+      WHERE employee_id=$1
+        AND work_date=$2
+        AND project_id=$3
+        AND task_id=$4
+        AND scan_status <> 'Rejected'`,
+    [employeeId, workDate, projectId, taskId]
+  );
+
+  const openR = await client.query(
+    `SELECT COUNT(*)::int AS c
+       FROM task_session
+      WHERE employee_id=$1
+        AND work_date=$2
+        AND project_id=$3
+        AND task_id=$4
+        AND status='OPEN'`,
+    [employeeId, workDate, projectId, taskId]
+  );
+
+  return {
+    prior_count: scansR.rows[0]?.c ?? 0,
+    open_count: openR.rows[0]?.c ?? 0,
+  };
+}
+
 // Keep your real implementation if you already have one elsewhere.
 async function rebuildTaskSessionsForDay(client, employeeId, workDate) {
   const q = (t, p) => client.query(t, p);
 
-  // Remove and rebuild sessions from scans
   await q(`DELETE FROM task_session WHERE employee_id=$1 AND work_date=$2`, [employeeId, workDate]);
 
   const scans = await q(
@@ -271,7 +271,6 @@ router.post("/batch", requireAuth, async (req, res) => {
   const auth = req.headers.authorization || "";
 
   try {
-    // Robust body parsing
     let b = req.body;
     if (typeof b === "string") {
       try {
@@ -280,7 +279,6 @@ router.post("/batch", requireAuth, async (req, res) => {
     }
     if (!b || typeof b !== "object") b = {};
 
-    // Accept items OR scans (array or single object)
     let rawItems = [];
     if (Array.isArray(b.items)) rawItems = b.items;
     else if (Array.isArray(b.scans)) rawItems = b.scans;
@@ -290,8 +288,6 @@ router.post("/batch", requireAuth, async (req, res) => {
     const deviceId = b.device_id || b.deviceId || "unknown";
     const workDateTop = b.work_date || b.workDate || null;
 
-    // IMPORTANT:
-    // do NOT use await here. We only parse/store raw values.
     const scans = rawItems
       .map((it) => {
         if (!it || typeof it !== "object") return null;
@@ -299,17 +295,13 @@ router.post("/batch", requireAuth, async (req, res) => {
         let projectId = it.project_id || it.projectId || null;
         let taskId = it.task_id || it.taskId || null;
         let releaseId = null;
+        let qrDate = null;
 
         if (it.qr) {
           const parsed = parseQrFlexible(String(it.qr));
           if (parsed) {
-            if (parsed.release_id) {
-              releaseId = parsed.release_id;
-            }
-            if (parsed.project_id && parsed.task_id) {
-              projectId = parsed.project_id;
-              taskId = parsed.task_id;
-            }
+            if (parsed.release_id) releaseId = parsed.release_id;
+            if (parsed.qr_date) qrDate = parsed.qr_date;
           }
         }
 
@@ -328,7 +320,6 @@ router.post("/batch", requireAuth, async (req, res) => {
 
         const isOffline = it.is_offline === true || it.is_offline === 1;
 
-        // For secure QR, project/task may be resolved later from releaseId.
         if (!workDate) return null;
         if (!releaseId && (!projectId || !taskId)) return null;
 
@@ -336,13 +327,14 @@ router.post("/batch", requireAuth, async (req, res) => {
           client_reference_id:
             clientRef ||
             `${employeeId || "unknown"}-${workDate}-${projectId || "release"}-${taskId || releaseId}-${Date.now()}`,
-          work_date: workDate,
+          work_date: String(workDate),
           project_id: projectId ? String(projectId) : null,
           task_id: taskId ? String(taskId) : null,
           release_id: releaseId ? String(releaseId) : null,
+          qr_date: qrDate ? String(qrDate) : null,
           scan_timestamp_device: ts,
           is_offline: !!isOffline,
-          qr: it.qr ? String(it.qr) : `${projectId}|${taskId}`,
+          qr: it.qr ? String(it.qr) : null,
         };
       })
       .filter(Boolean);
@@ -410,8 +402,6 @@ router.post("/batch", requireAuth, async (req, res) => {
       for (const s of scans) {
         let activeRelease = null;
 
-        // NEW secure QR flow:
-        // If release_id was scanned, resolve exact release here.
         if (s.release_id) {
           const rel = await findReleaseById(client, s.release_id);
 
@@ -423,6 +413,19 @@ router.post("/batch", requireAuth, async (req, res) => {
               error: {
                 code: "INVALID_RELEASE",
                 message: "QR release not found.",
+              },
+            });
+            continue;
+          }
+
+          if (s.qr_date && s.work_date && String(s.qr_date) !== String(s.work_date)) {
+            results.push({
+              client_reference_id: s.client_reference_id,
+              qr: s.qr,
+              status: "Rejected",
+              error: {
+                code: "QR_EXPIRED",
+                message: "QR code expired for this work date.",
               },
             });
             continue;
@@ -458,7 +461,6 @@ router.post("/batch", requireAuth, async (req, res) => {
           s.task_id = rel.task_id;
           activeRelease = rel;
         } else {
-          // OLD QR flow
           activeRelease = await findActiveReleaseForSupervisor(
             client,
             s.project_id,
@@ -493,7 +495,6 @@ router.post("/batch", requireAuth, async (req, res) => {
           continue;
         }
 
-        // Capacity enforcement
         const maxWorkers =
           activeRelease.max_workers === null || activeRelease.max_workers === undefined
             ? null
@@ -525,35 +526,58 @@ router.post("/batch", requireAuth, async (req, res) => {
           }
         }
 
-        const dup = await isDuplicateScan(client, employeeId, s.work_date, s.project_id, s.task_id);
-        if (dup) {
-          results.push({
-            client_reference_id: s.client_reference_id,
-            qr: s.qr,
-            status: "Rejected",
-            error: { code: "DUPLICATE", message: "Duplicate task for this day." },
-          });
-          continue;
-        }
-
-        const acceptedCount = await acceptedCountForDay(client, employeeId, s.work_date);
+        const sameTask = await getSameTaskHistory(
+          client,
+          employeeId,
+          s.work_date,
+          s.project_id,
+          s.task_id
+        );
 
         let scanStatus = "Accepted";
         let approvalId = null;
         let note = "Accepted.";
+        let approvalType = null;
 
-        if (acceptedCount >= 3) {
+        // Duplicate same task rules
+        if (sameTask.prior_count > 0) {
+          if (sameTask.open_count > 0) {
+            results.push({
+              client_reference_id: s.client_reference_id,
+              qr: s.qr,
+              status: "Rejected",
+              error: {
+                code: "DUPLICATE_OPEN_TASK",
+                message: "This task is already open for this worker.",
+              },
+              release_id: activeRelease.release_id,
+            });
+            continue;
+          } else {
+            scanStatus = "PendingApproval";
+            note = "Pending supervisor approval: same task scanned again after closure.";
+            approvalType = "RepeatTaskSameDay";
+          }
+        }
+
+        const acceptedCount = await acceptedCountForDay(client, employeeId, s.work_date);
+
+        if (scanStatus === "Accepted" && acceptedCount >= 3) {
           scanStatus = "PendingApproval";
           note = "Pending supervisor approval (>3 tasks/day).";
+          approvalType = "Over3Tasks";
+        }
 
+        if (scanStatus === "PendingApproval") {
           const ai = await client.query(
             `INSERT INTO approval_item (
                approval_type, employee_id, supervisor_employee_id,
                assignment_day_id, status, requested_payload, created_at, updated_at
              )
-             VALUES ('Over3Tasks', $1, $2, $3, 'Submitted', $4::jsonb, NOW(), NOW())
+             VALUES ($1, $2, $3, $4, 'Submitted', $5::jsonb, NOW(), NOW())
              RETURNING approval_id`,
             [
+              approvalType,
               employeeId,
               workerSupervisorId,
               assignmentDayId,
@@ -564,6 +588,7 @@ router.post("/batch", requireAuth, async (req, res) => {
                 via: "WorkerScan",
                 release_id: activeRelease.release_id,
                 supervisor_employee_id: workerSupervisorId,
+                duplicate_same_task: sameTask.prior_count > 0,
               }),
             ]
           );

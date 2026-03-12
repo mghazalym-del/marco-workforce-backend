@@ -6,6 +6,24 @@ const express = require("express");
 const router = express.Router();
 const db = require("../db");
 
+function parseQrFlexible(qr) {
+  if (typeof qr !== "string") return null;
+  const s = qr.trim();
+  if (!s) return null;
+
+  const parts = s.split("|").map((x) => x.trim());
+
+  // ONLY supported QR format:
+  // release_id|work_date
+  if (parts.length === 2) {
+    const [release_id, qr_date] = parts;
+    if (!release_id || !qr_date) return null;
+    return { release_id, qr_date };
+  }
+
+  return null;
+}
+
 // ---- DB helpers (support db exports: Pool, {pool}, {query}) ----
 function getPool() {
   if (db && typeof db.query === "function") return db;
@@ -45,12 +63,9 @@ function minutesBetween(a, b) {
   return Math.max(0, Math.floor(ms / 60000));
 }
 
-
 function endTsForWorkDate(workDate) {
-  // workDate: 'YYYY-MM-DD'
   const today = new Date().toISOString().slice(0, 10);
   if (String(workDate) < today) {
-    // cap to end-of-day to avoid massive durations for historical open tasks
     return new Date(String(workDate) + "T23:59:59.000Z");
   }
   return new Date();
@@ -144,21 +159,6 @@ async function rebuildTaskSessionsForDay(q, employeeId, workDate) {
   }
 }
 
-/**
- * POST /api/v1/supervisor/assign/scan
- * Supports:
- * - worker_employee_id / workerEmployeeId / employee_id / employeeId
- * - work_date / workDate
- * - qr "PROJECT|TASK" or "PROJECT/TASK" (optional if project_id+task_id provided)
- * - project_id + task_id (preferred, supports temporary codes)
- * - override_duplicate
- * - reopen_day
- * - scan_timestamp_device (optional)
- *
- * NOTE:
- * Supervisor assigning a task should NOT create a supervisor-approval for the same scan.
- * Over-3-tasks/day approval applies to WORKER scans only.
- */
 const __tableColsCache = {};
 async function getTableColumns(q, tableName) {
   if (__tableColsCache[tableName]) return __tableColsCache[tableName];
@@ -203,8 +203,6 @@ async function insertDynamic(q, tableName, dataObj, returningCandidates = []) {
 }
 
 // POST /api/v1/supervisor/close-open-task
-// Closes a worker's single OPEN task_session for a given work_date.
-// For historical work dates, end_ts is capped to end-of-day to avoid huge durations.
 router.post("/close-open-task", requireAuth, async (req, res) => {
   const supervisorId = req.user?.employee_id || employeeIdFromAuth(req);
   const employeeId = (req.body?.employee_id || req.body?.employeeId || "").toString().trim();
@@ -221,7 +219,6 @@ router.post("/close-open-task", requireAuth, async (req, res) => {
     const data = await withClient(async (client) => {
       const q = (t, p) => client.query(t, p);
 
-      // Find latest OPEN session for that worker/day
       const r = await q(
         `
         SELECT session_id, project_id, task_id, start_ts
@@ -253,7 +250,6 @@ router.post("/close-open-task", requireAuth, async (req, res) => {
         [endTs.toISOString(), duration, row.session_id]
       );
 
-      // Audit in approvals_history if you want later; for now return actor.
       return { closed: true, closed_by: supervisorId, session: u.rows[0] };
     });
 
@@ -272,7 +268,9 @@ router.post("/assign/scan", requireAuth, async (req, res) => {
   console.log("[SUP ASSIGN] body:", req.body);
 
   const supervisorId = req.employee_id || employeeIdFromAuth(req);
-  if (!supervisorId) return res.status(401).json({ success: false, error: "Unauthorized" });
+  if (!supervisorId) {
+    return res.status(401).json({ success: false, error: "Unauthorized" });
+  }
 
   const workerEmployeeId =
     req.body?.worker_employee_id ||
@@ -281,21 +279,99 @@ router.post("/assign/scan", requireAuth, async (req, res) => {
     req.body?.employeeId;
 
   const workDate = req.body?.work_date || req.body?.workDate;
-
   const overrideDuplicate = !!req.body?.override_duplicate;
   const reopenDay = !!req.body?.reopen_day;
 
-  // Prefer explicit project_id/task_id (temporary codes supported)
   let projectId = req.body?.project_id || req.body?.projectId || null;
   let taskId = req.body?.task_id || req.body?.taskId || null;
 
-  // Fallback to parsing qr
   const qr = req.body?.qr || null;
-  if ((!projectId || !taskId) && qr) {
+  let releaseId = null;
+  let qrDate = null;
+
+  if (qr) {
     const parsed = parseQrFlexible(String(qr));
-    if (parsed) {
-      projectId = projectId || parsed.project_id;
-      taskId = taskId || parsed.task_id;
+
+    if (!parsed) {
+      return res.status(400).json({
+        success: false,
+        error: {
+          code: "INVALID_QR",
+          message: "Invalid MARCO QR format",
+        },
+      });
+    }
+
+    releaseId = parsed.release_id;
+    qrDate = parsed.qr_date;
+  }
+
+  const today = new Date().toISOString().slice(0, 10);
+
+  if (qrDate && qrDate !== today) {
+    return res.status(400).json({
+      success: false,
+      error: {
+        code: "QR_EXPIRED",
+        message: "QR code expired. Ask Site Engineer to print new QR.",
+      },
+    });
+  }
+
+  // Resolve project/task from release
+  if (releaseId) {
+    try {
+      const pool = getPool();
+      const rel = await pool.query(
+        `
+        SELECT project_id, task_id, supervisor_employee_id, release_status
+        FROM task_releases
+        WHERE release_id = $1
+        LIMIT 1
+        `,
+        [releaseId]
+      );
+
+      if (rel.rowCount === 0) {
+        return res.status(404).json({
+          success: false,
+          error: {
+            code: "RELEASE_NOT_FOUND",
+            message: "Release not found",
+          },
+        });
+      }
+
+      const release = rel.rows[0];
+
+      if (String(release.release_status || "").toUpperCase() !== "ACTIVE") {
+        return res.status(409).json({
+          success: false,
+          error: {
+            code: "RELEASE_NOT_ACTIVE",
+            message: "Release is not active",
+          },
+        });
+      }
+
+      if (String(release.supervisor_employee_id || "") !== String(supervisorId)) {
+        return res.status(403).json({
+          success: false,
+          error: {
+            code: "RELEASE_NOT_FOR_SUPERVISOR",
+            message: "This QR is not released for the logged-in supervisor",
+          },
+        });
+      }
+
+      projectId = release.project_id;
+      taskId = release.task_id;
+    } catch (e) {
+      console.error("POST /supervisor/assign/scan release lookup error:", e);
+      return res.status(500).json({
+        success: false,
+        error: { code: "RELEASE_LOOKUP_FAILED", message: e.message || "Release lookup failed" },
+      });
     }
   }
 
@@ -306,12 +382,13 @@ router.post("/assign/scan", requireAuth, async (req, res) => {
       error: { code: "BAD_REQUEST", message: "worker_employee_id and work_date are required" },
     });
   }
+
   if (!projectId || !taskId) {
     return res.status(400).json({
       success: false,
       error: {
         code: "BAD_QR",
-        message: "Invalid QR format. Expected PROJECT|TASK or PROJECT/TASK",
+        message: "Invalid MARCO QR or release not found",
       },
     });
   }
@@ -324,10 +401,6 @@ router.post("/assign/scan", requireAuth, async (req, res) => {
       const q = (t, p) => client.query(t, p);
 
       const wd = await ensureWorkDay(q, workerEmployeeId, workDate);
-
-      
-
-      // Hard lock: once FINALIZED by Site Engineer, the day cannot be reopened or modified
       const dayStatus = String(wd.day_status || "").toUpperCase();
 
       if (dayStatus === "FINALIZED") {
@@ -376,7 +449,6 @@ router.post("/assign/scan", requireAuth, async (req, res) => {
         throw err;
       }
 
-      // Ensure assignment_day exists
       const ad = await q(
         `INSERT INTO assignment_day (employee_id, work_date, status, total_tasks, has_offline_scans)
          VALUES ($1, $2, 'Accepted', 0, false)
@@ -386,7 +458,6 @@ router.post("/assign/scan", requireAuth, async (req, res) => {
       );
       const assignmentDayId = ad.rows[0].assignment_day_id;
 
-      // Duplicate check (ignore Rejected)
       if (!overrideDuplicate) {
         const dup = await q(
           `SELECT 1 FROM assignment_scan
@@ -403,7 +474,6 @@ router.post("/assign/scan", requireAuth, async (req, res) => {
         }
       }
 
-      // Insert scan as Accepted (supervisor-assigned tasks never require supervisor approval)
       const crypto = require("crypto");
       const clientReferenceId =
         req.body?.client_reference_id ||
@@ -423,7 +493,7 @@ router.post("/assign/scan", requireAuth, async (req, res) => {
         supervisor_employee_id: supervisorId,
         is_offline: false,
         scan_status: "Accepted",
-        status: "Accepted", // some schemas use 'status'
+        status: "Accepted",
         device_id: deviceId,
         client_reference_id: clientReferenceId,
         created_at: now,
@@ -431,7 +501,6 @@ router.post("/assign/scan", requireAuth, async (req, res) => {
       };
 
       const ins = await insertDynamic(q, "assignment_scan", dataToInsert, ["scan_id", "id"]);
-
       await rebuildTaskSessionsForDay(q, workerEmployeeId, workDate);
 
       return {
@@ -494,7 +563,6 @@ router.post("/close-day", requireAuth, async (req, res) => {
         };
       }
 
-      // Pending approvals for this worker/day
       const pendingScan = await q(
         `SELECT 1 FROM assignment_scan
          WHERE employee_id=$1 AND work_date=$2 AND scan_status='PendingApproval'
@@ -533,7 +601,6 @@ router.post("/close-day", requireAuth, async (req, res) => {
         throw err;
       }
 
-      // Open sessions for THIS worker/day
       const open = await q(
         `SELECT session_id, project_id, task_id, start_ts
          FROM task_session
@@ -602,7 +669,6 @@ router.get("/workers", requireAuth, async (req, res) => {
     const out = await withClient(async (client) => {
       const q = (t, p) => client.query(t, p);
 
-      // Try full schema first
       try {
         const r = await q(
           `SELECT employee_id, full_name, status
@@ -613,7 +679,6 @@ router.get("/workers", requireAuth, async (req, res) => {
         );
         return r.rows;
       } catch (e) {
-        // Fallback if some columns don't exist (ex: status/is_supervisor)
         const r2 = await q(
           `SELECT employee_id, full_name
              FROM employees
@@ -624,52 +689,12 @@ router.get("/workers", requireAuth, async (req, res) => {
       }
     });
 
-    console.log(
-      "[SUP ASSIGN] RESPONSE JSON:",
-      JSON.stringify({ success: true, data: { /* same object you return */ } }, null, 2)
-    );
-
-    // --- DEBUG: log ANY response returned by this route (temporary)
-    const _json = res.json.bind(res);
-    const _status = res.status.bind(res);
-
-    res.status = (code) => {
-      res.__statusCode = code;
-      return _status(code);
-    };
-
-    res.json = (body) => {
-      console.log(
-        "[SUP ASSIGN] RESPONSE JSON:",
-        JSON.stringify(
-          { statusCode: res.__statusCode || 200, body },
-          null,
-          2
-        )
-      );
-      return _json(body);
-    };
-    // --- END DEBUG
-
-    const _send = res.send.bind(res);
-    res.send = (body) => {
-      try {
-        console.log("[SUP ASSIGN] RESPONSE SEND:", body);
-      } catch {}
-      return _send(body);
-    };
-
-
-
-
     return res.json(out);
   } catch (e) {
     console.error("GET /supervisor/workers error:", e);
     return res.status(500).json({ success: false, error: e.message || "Unexpected error" });
   }
 });
-
-
 
 /**
  * POST /api/v1/supervisor/finalize-day
@@ -754,7 +779,6 @@ router.post("/finalize-supervisor-day", requireAuth, async (req, res) => {
     const result = await withClient(async (client) => {
       const q = (t, p) => client.query(t, p);
 
-      // workers who had supervisor-assigned scans that day
       const w = await q(
         `SELECT DISTINCT employee_id
          FROM assignment_scan
@@ -800,6 +824,7 @@ router.post("/finalize-supervisor-day", requireAuth, async (req, res) => {
     return res.status(status).json(e.payload || { success: false, error: e.message || "Unexpected error" });
   }
 });
+
 /**
  * POST /api/v1/supervisor/return-supervisor-day
  * SE/PM action: return ALL worker days under a supervisor back to OPEN (unless FINALIZED).
@@ -823,7 +848,6 @@ router.post("/return-supervisor-day", requireAuth, async (req, res) => {
     const result = await withClient(async (client) => {
       const q = (t, p) => client.query(t, p);
 
-      // workers who had supervisor-assigned scans that day (same logic as finalize-supervisor-day)
       const w = await q(
         `SELECT DISTINCT employee_id
          FROM assignment_scan
@@ -844,7 +868,6 @@ router.post("/return-supervisor-day", requireAuth, async (req, res) => {
           continue;
         }
 
-        // Return day back to OPEN
         await q(
           `UPDATE work_day
            SET day_status='OPEN',
@@ -873,6 +896,5 @@ router.post("/return-supervisor-day", requireAuth, async (req, res) => {
     return res.status(status).json(e.payload || { success: false, error: e.message || "Unexpected error" });
   }
 });
-
 
 module.exports = router;

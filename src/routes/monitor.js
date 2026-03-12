@@ -428,5 +428,162 @@ router.get("/supervisors/:supervisor_id/workers", requireAuth, async (req, res) 
   }
 });
 
+/**
+ * GET /api/v1/monitor/supervisors/:supervisor_id/alerts?work_date=YYYY-MM-DD
+ * Supervisor alert feed (read-only)
+ */
+router.get("/supervisors/:supervisor_id/alerts", requireAuth, async (req, res) => {
+  try {
+    const supervisorId = String(req.params.supervisor_id || "").trim();
+    const workDate = parseISODate(req.query.work_date);
+
+    if (!supervisorId) {
+      return res.status(400).json({
+        success: false,
+        error: { code: "BAD_REQUEST", message: "supervisor_id required" },
+      });
+    }
+
+    if (!workDate) {
+      return res.status(400).json({
+        success: false,
+        error: { code: "BAD_REQUEST", message: "work_date must be YYYY-MM-DD" },
+      });
+    }
+
+    // workers with OPEN sessions
+    const openTasks = await queryMany(
+      `
+      SELECT employee_id, project_id, task_id
+      FROM task_session
+      WHERE status='OPEN'
+        AND work_date=$1
+        AND employee_id IN (
+          SELECT employee_id
+          FROM employees
+          WHERE supervisor_employee_id=$2
+        )
+      `,
+      [workDate, supervisorId]
+    );
+
+    // pending approvals
+    const approvals = await queryMany(
+      `
+      SELECT approval_id, employee_id, approval_type, created_at
+      FROM approval_item
+      WHERE supervisor_employee_id=$1
+        AND status='Submitted'
+      ORDER BY created_at DESC
+      LIMIT 20
+      `,
+      [supervisorId]
+    );
+
+    const alerts = [];
+
+    for (const t of openTasks) {
+      alerts.push({
+        type: "OPEN_TASK",
+        severity: "warning",
+        message: `Worker ${t.employee_id} still running task ${t.project_id}/${t.task_id}`,
+      });
+    }
+
+    for (const a of approvals) {
+      alerts.push({
+        type: "PENDING_APPROVAL",
+        severity: "info",
+        message: `Approval waiting: ${a.approval_type} for worker ${a.employee_id}`,
+      });
+    }
+
+    return res.json({
+      success: true,
+      data: {
+        supervisor_id: supervisorId,
+        work_date: workDate,
+        alerts,
+      },
+    });
+  } catch (e) {
+    console.error("[MONITOR] supervisor alerts error:", e);
+    return res.status(500).json({
+      success: false,
+      error: { code: "INTERNAL_ERROR", message: e.message },
+    });
+  }
+});
+
+/**
+ * GET /api/v1/monitor/se-alerts?work_date=YYYY-MM-DD
+ * Site Engineer alert feed (read-only)
+ */
+router.get("/se-alerts", requireAuth, async (req, res) => {
+  try {
+    const workDate = parseISODate(req.query.work_date);
+
+    if (!workDate) {
+      return res.status(400).json({
+        success: false,
+        error: { code: "BAD_REQUEST", message: "work_date must be YYYY-MM-DD" },
+      });
+    }
+
+    const alerts = [];
+
+    // 1️⃣ workers still running tasks
+    const openSessions = await queryMany(
+      `
+      SELECT employee_id, project_id, task_id
+      FROM task_session
+      WHERE status='OPEN'
+        AND work_date=$1
+      `,
+      [workDate]
+    );
+
+    for (const s of openSessions) {
+      alerts.push({
+        type: "OPEN_SESSION",
+        severity: "warning",
+        message: `Worker ${s.employee_id} still running ${s.project_id}/${s.task_id}`,
+      });
+    }
+
+    // 2️⃣ tasks under minimum workers
+    const underMin = await queryMany(
+      `
+      SELECT project_id, task_id, current_workers, min_workers
+      FROM task_release_dashboard
+      WHERE work_date=$1
+        AND current_workers < min_workers
+      `,
+      [workDate]
+    );
+
+    for (const r of underMin) {
+      alerts.push({
+        type: "UNDER_MIN",
+        severity: "warning",
+        message: `Task ${r.project_id}/${r.task_id} below minimum workers (${r.current_workers}/${r.min_workers})`,
+      });
+    }
+
+    return res.json({
+      success: true,
+      data: {
+        work_date: workDate,
+        alerts,
+      },
+    });
+  } catch (e) {
+    console.error("[MONITOR] SE alerts error:", e);
+    return res.status(500).json({
+      success: false,
+      error: { code: "INTERNAL_ERROR", message: e.message },
+    });
+  }
+});
 
 module.exports = router;

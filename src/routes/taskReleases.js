@@ -146,7 +146,6 @@ router.post("/", requireAuth, async (req, res) => {
       });
     }
 
-    // Prevent duplicate ACTIVE release for same project/task/supervisor
     const existing = await pool.query(
       `
       SELECT
@@ -262,7 +261,7 @@ router.get("/my", requireAuth, async (req, res) => {
     const role = String(emp.rows[0].role || "").toUpperCase();
 
     let result;
-    if (role === "ADMIN") {
+    if (role === "ADMIN" || role === "SUPERVISOR") {
       result = await pool.query(
         `
         SELECT
@@ -471,7 +470,7 @@ router.get("/dashboard", requireAuth, async (req, res) => {
     if (role === "SE") {
       where.push(`tr.se_employee_id = $${paramIndex++}`);
       params.push(employeeId);
-    } else if (role === "ADMIN") {
+    } else if (role === "ADMIN" || role === "SUPERVISOR") {
       where.push(`tr.supervisor_employee_id = $${paramIndex++}`);
       params.push(employeeId);
     } else if (role === "PM") {
@@ -520,28 +519,35 @@ router.get("/dashboard", requireAuth, async (req, res) => {
         ON ts.project_id = tr.project_id
        AND ts.task_id = tr.task_id
       WHERE ${where.join(" AND ")}
-      ORDER BY tr.project_id, tr.task_id, tr.released_at DESC
+      ORDER BY tr.released_at DESC
       `,
       params
     );
 
-    const data = result.rows.map((row) => {
-      const current = Number(row.current_workers || 0);
-      const min = Number(row.min_workers || 0);
-      const max = row.max_workers === null ? null : Number(row.max_workers);
+    const rows = result.rows.map((r) => {
+      const current = Number(r.current_workers || 0);
+      const min = Number(r.min_workers || 0);
+      const max =
+        r.max_workers === null || r.max_workers === undefined
+          ? null
+          : Number(r.max_workers);
+
+      const availableSlots =
+        max === null || Number.isNaN(max) ? null : Math.max(max - current, 0);
+
       return {
-        ...row,
+        ...r,
         current_workers: current,
         min_workers: min,
         max_workers: max,
+        available_slots: availableSlots,
         capacity_status: capacityStatus(current, min, max),
-        available_slots: max === null ? null : Math.max(0, max - current),
       };
     });
 
     return res.json({
       success: true,
-      data,
+      data: rows,
     });
   } catch (e) {
     console.error("[task-releases][GET /dashboard] error:", e);
@@ -566,6 +572,135 @@ router.patch("/:release_id/close", requireAuth, async (req, res) => {
       });
     }
 
+    const actor = await pool.query(
+      `
+      SELECT employee_id, role
+      FROM employees
+      WHERE employee_id = $1
+      LIMIT 1
+      `,
+      [employeeId]
+    );
+
+    if (actor.rowCount === 0) {
+      return res.status(404).json({
+        success: false,
+        error: {
+          code: "EMPLOYEE_NOT_FOUND",
+          message: "Employee not found",
+        },
+      });
+    }
+
+    const role = String(actor.rows[0].role || "").toUpperCase();
+    if (!["SE", "PM"].includes(role)) {
+      return res.status(403).json({
+        success: false,
+        error: {
+          code: "ROLE_NOT_ALLOWED",
+          message: "Only SE and PM can close task releases",
+        },
+      });
+    }
+
+    const rel = await pool.query(
+      `
+      SELECT
+        tr.release_id,
+        tr.project_id,
+        tr.task_id,
+        tr.se_employee_id,
+        se.full_name AS se_name,
+        tr.supervisor_employee_id,
+        sup.full_name AS supervisor_name,
+        tr.release_status,
+        tr.released_at,
+        tr.released_by,
+        tr.min_workers,
+        tr.max_workers
+      FROM task_releases tr
+      LEFT JOIN employees sup
+        ON sup.employee_id = tr.supervisor_employee_id
+      LEFT JOIN employees se
+        ON se.employee_id = tr.se_employee_id
+      WHERE tr.release_id = $1
+      LIMIT 1
+      `,
+      [release_id]
+    );
+
+    if (rel.rowCount === 0) {
+      return res.status(404).json({
+        success: false,
+        error: {
+          code: "RELEASE_NOT_FOUND",
+          message: "Release not found",
+        },
+      });
+    }
+
+    const release = rel.rows[0];
+
+    if (String(release.release_status || "").toUpperCase() !== "ACTIVE") {
+      return res.status(409).json({
+        success: false,
+        error: {
+          code: "RELEASE_NOT_ACTIVE",
+          message: "Only ACTIVE releases can be closed",
+        },
+        data: release,
+      });
+    }
+
+    const open = await pool.query(
+      `
+      SELECT
+        e.supervisor_employee_id,
+        sup.full_name AS supervisor_name,
+        COUNT(DISTINCT ts.employee_id)::int AS open_workers_count,
+        json_agg(
+          DISTINCT jsonb_build_object(
+            'employee_id', ts.employee_id,
+            'full_name', e.full_name
+          )
+        ) FILTER (WHERE ts.employee_id IS NOT NULL) AS workers
+      FROM task_session ts
+      LEFT JOIN employees e
+        ON e.employee_id = ts.employee_id
+      LEFT JOIN employees sup
+        ON sup.employee_id = e.supervisor_employee_id
+      WHERE ts.project_id = $1
+        AND ts.task_id = $2
+        AND ts.status = 'OPEN'
+      GROUP BY e.supervisor_employee_id, sup.full_name
+      ORDER BY e.supervisor_employee_id
+      `,
+      [release.project_id, release.task_id]
+    );
+
+    if (open.rowCount > 0) {
+      return res.status(409).json({
+        success: false,
+        error: {
+          code: "OPEN_TASKS_EXIST",
+          message: "Cannot close release because workers still have open task sessions",
+        },
+        data: {
+          release_id: release.release_id,
+          project_id: release.project_id,
+          task_id: release.task_id,
+          supervisor_employee_id: release.supervisor_employee_id,
+          supervisor_name: release.supervisor_name,
+          blockers: open.rows.map((r) => ({
+            supervisor_employee_id: r.supervisor_employee_id,
+            supervisor_name: r.supervisor_name,
+            open_workers_count: r.open_workers_count,
+            workers: Array.isArray(r.workers) ? r.workers : [],
+          })),
+        },
+      });
+    }
+
     const result = await pool.query(
       `
       UPDATE task_releases
@@ -585,16 +720,6 @@ router.patch("/:release_id/close", requireAuth, async (req, res) => {
       `,
       [release_id]
     );
-
-    if (result.rowCount === 0) {
-      return res.status(404).json({
-        success: false,
-        error: {
-          code: "RELEASE_NOT_FOUND",
-          message: "Release not found",
-        },
-      });
-    }
 
     return res.json({
       success: true,
