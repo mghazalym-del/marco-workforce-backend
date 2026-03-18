@@ -1,11 +1,9 @@
 /**
  * MARCO Workforce - monitor.js (READ-ONLY)
  *
- * Desktop Phase 1 APIs:
- * - Worker Day View: work_day + assignment_scan + task_session(s)
- * - Dashboard summary
- * - Project/task activity
- * - Supervisors + supervisor day summaries
+ * Keeps existing monitor routes and adds:
+ * - Supervisor alerts with schedule-aware rules
+ * - SE dashboard alerts
  *
  * Safety:
  * - GET only
@@ -22,7 +20,6 @@ const requireAuth = require("../middleware/requireAuth");
 // ---------- helpers ----------
 function parseISODate(s) {
   if (!s || typeof s !== "string") return null;
-  // Expect YYYY-MM-DD
   const m = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
   if (!m) return null;
   const d = new Date(`${s}T00:00:00Z`);
@@ -45,9 +42,15 @@ async function queryMany(text, params) {
   return r.rows || [];
 }
 
+function currentHourKSA() {
+  const now = new Date();
+  const ksa = new Date(now.toLocaleString("en-US", { timeZone: "Asia/Riyadh" }));
+  return ksa.getHours();
+}
+
 /**
  * Your DB has both task_session and task_sessions.
- * We’ll try task_session first (it’s used in scans.js), then fallback to task_sessions.
+ * We’ll try task_session first, then fallback to task_sessions.
  */
 async function getSessions(employeeId, workDate) {
   const q1 = `
@@ -71,11 +74,10 @@ async function getSessions(employeeId, workDate) {
   }
 }
 
-// ---------- routes ----------
+// ---------- original routes ----------
 
 /**
  * GET /api/v1/monitor/worker/:employee_id/day?work_date=YYYY-MM-DD
- * Returns: work_day header + scans + sessions
  */
 router.get("/worker/:employee_id/day", requireAuth, async (req, res) => {
   try {
@@ -119,7 +121,6 @@ router.get("/worker/:employee_id/day", requireAuth, async (req, res) => {
 
     const sessions = await getSessions(employeeId, workDate);
 
-    // lightweight summary
     const totalAcceptedScans = scans.filter((s) => s.scan_status === "Accepted").length;
     const totalRejectedScans = scans.length - totalAcceptedScans;
     const totalMinutes = sessions.reduce((sum, s) => sum + (s.duration_minutes || 0), 0);
@@ -127,7 +128,7 @@ router.get("/worker/:employee_id/day", requireAuth, async (req, res) => {
     return res.json({
       success: true,
       data: {
-        work_day: workDay, // can be null if not created yet
+        work_day: workDay,
         scans,
         sessions,
         summary: {
@@ -148,7 +149,6 @@ router.get("/worker/:employee_id/day", requireAuth, async (req, res) => {
 
 /**
  * GET /api/v1/monitor/workers?status=Active
- * Simple read-only directory (useful for desktop search/filter)
  */
 router.get("/workers", requireAuth, async (req, res) => {
   try {
@@ -176,7 +176,6 @@ router.get("/workers", requireAuth, async (req, res) => {
 
 /**
  * GET /api/v1/monitor/dashboard?work_date=YYYY-MM-DD
- * Aggregates counts for a single date
  */
 router.get("/dashboard", requireAuth, async (req, res) => {
   try {
@@ -229,7 +228,12 @@ router.get("/dashboard", requireAuth, async (req, res) => {
       data: {
         work_date: workDate,
         day_counts: dayCounts || { open_days: 0, closed_days: 0 },
-        scan_counts: scanCounts || { total_scans: 0, accepted_scans: 0, rejected_scans: 0, offline_scans: 0 },
+        scan_counts: scanCounts || {
+          total_scans: 0,
+          accepted_scans: 0,
+          rejected_scans: 0,
+          offline_scans: 0,
+        },
         top_tasks: topTasks,
       },
     });
@@ -244,7 +248,6 @@ router.get("/dashboard", requireAuth, async (req, res) => {
 
 /**
  * GET /api/v1/monitor/activity/projects?work_date=YYYY-MM-DD&limit=200
- * Project/task activity rollup from scans
  */
 router.get("/activity/projects", requireAuth, async (req, res) => {
   try {
@@ -277,7 +280,10 @@ router.get("/activity/projects", requireAuth, async (req, res) => {
       [workDate]
     );
 
-    return res.json({ success: true, data: { work_date: workDate, items: rows } });
+    return res.json({
+      success: true,
+      data: { work_date: workDate, items: rows },
+    });
   } catch (e) {
     console.error("[MONITOR] activity projects error:", e);
     return res.status(500).json({
@@ -289,7 +295,6 @@ router.get("/activity/projects", requireAuth, async (req, res) => {
 
 /**
  * GET /api/v1/monitor/supervisors
- * Returns active supervisors (based on employees.is_supervisor)
  */
 router.get("/supervisors", requireAuth, async (req, res) => {
   try {
@@ -315,7 +320,6 @@ router.get("/supervisors", requireAuth, async (req, res) => {
 
 /**
  * GET /api/v1/monitor/supervisors/:supervisor_id/days?from=YYYY-MM-DD&to=YYYY-MM-DD
- * Summary per day for a supervisor (SE review page later)
  */
 router.get("/supervisors/:supervisor_id/days", requireAuth, async (req, res) => {
   try {
@@ -356,7 +360,6 @@ router.get("/supervisors/:supervisor_id/days", requireAuth, async (req, res) => 
       [supervisorId, from, to]
     );
 
-
     return res.json({
       success: true,
       data: { supervisor_id: supervisorId, from, to, days: rows },
@@ -372,8 +375,6 @@ router.get("/supervisors/:supervisor_id/days", requireAuth, async (req, res) => 
 
 /**
  * GET /api/v1/monitor/supervisors/:supervisor_id/workers?work_date=YYYY-MM-DD
- * Returns distinct workers under a supervisor on a specific date (based on assignment_scan.supervisor_employee_id)
- * Used for Site Engineer drill-down: Supervisor Day -> Worker list -> Worker Day details.
  */
 router.get("/supervisors/:supervisor_id/workers", requireAuth, async (req, res) => {
   try {
@@ -409,7 +410,7 @@ router.get("/supervisors/:supervisor_id/workers", requireAuth, async (req, res) 
       JOIN employees e2 ON e2.employee_id = x.employee_id
       LEFT JOIN work_day wd
         ON wd.employee_id = x.employee_id
-      AND wd.work_date = $2::date
+       AND wd.work_date = $2::date
       ORDER BY e2.employee_id
       `,
       [supervisorId, workDate]
@@ -428,5 +429,316 @@ router.get("/supervisors/:supervisor_id/workers", requireAuth, async (req, res) 
   }
 });
 
+// ---------- supervisor alerts ----------
+router.get("/supervisors/:supervisor_id/alerts", requireAuth, async (req, res) => {
+  try {
+    const supervisorId = String(req.params.supervisor_id || "").trim();
+    const workDate = parseISODate(req.query.work_date);
+    const hour = currentHourKSA();
+
+    if (!supervisorId || !workDate) {
+      return res.status(400).json({
+        success: false,
+        error: { code: "BAD_REQUEST", message: "supervisor_id and work_date required" },
+      });
+    }
+
+    const alerts = [];
+
+    // after 10:00 → workers with no accepted scan
+    if (hour >= 10) {
+      const noScan = await queryMany(
+        `
+        SELECT e.employee_id, e.full_name
+        FROM employees e
+        WHERE TRIM(UPPER(e.supervisor_employee_id)) = TRIM(UPPER($1))
+          AND NOT EXISTS (
+            SELECT 1
+            FROM assignment_scan a
+            WHERE a.employee_id = e.employee_id
+              AND a.work_date = $2
+              AND a.scan_status = 'Accepted'
+          )
+        ORDER BY e.employee_id
+        `,
+        [supervisorId, workDate]
+      );
+
+      for (const r of noScan) {
+        alerts.push({
+          type: "NO_SCAN",
+          severity: "warning",
+          message: `Worker ${r.employee_id}${r.full_name ? " - " + r.full_name : ""} has not scanned today`,
+        });
+      }
+    }
+
+    // after 14:00 → workers still running tasks
+    if (hour >= 14) {
+      const openTasks = await queryMany(
+        `
+        SELECT ts.employee_id, e.full_name, ts.project_id, ts.task_id
+        FROM task_session ts
+        LEFT JOIN employees e ON e.employee_id = ts.employee_id
+        WHERE ts.status='OPEN'
+          AND ts.work_date=$1
+          AND ts.employee_id IN (
+            SELECT employee_id
+            FROM employees
+            WHERE TRIM(UPPER(supervisor_employee_id)) = TRIM(UPPER($2))
+          )
+        ORDER BY ts.employee_id
+        `,
+        [workDate, supervisorId]
+      );
+
+      for (const t of openTasks) {
+        alerts.push({
+          type: "OPEN_TASK",
+          severity: "warning",
+          message: `Worker ${t.employee_id}${t.fullName ? " - " + t.full_name : ""} still running task ${t.project_id}/${t.task_id}`,
+        });
+      }
+    }
+
+    // pending approvals
+    const approvals = await queryMany(
+      `
+      SELECT approval_id, employee_id, approval_type, created_at
+      FROM approval_item
+      WHERE TRIM(UPPER(supervisor_employee_id)) = TRIM(UPPER($1))
+        AND status='Submitted'
+      ORDER BY created_at DESC
+      LIMIT 20
+      `,
+      [supervisorId]
+    );
+
+    for (const a of approvals) {
+      alerts.push({
+        type: "PENDING_APPROVAL",
+        severity: "info",
+        message: `Approval waiting: ${a.approval_type} for worker ${a.employee_id}`,
+      });
+    }
+
+    // after 19:00 → workers day not closed
+    if (hour >= 19) {
+      const notClosed = await queryMany(
+        `
+        SELECT e.employee_id, e.full_name
+        FROM employees e
+        LEFT JOIN work_day wd
+          ON wd.employee_id = e.employee_id
+         AND wd.work_date = $2
+        WHERE TRIM(UPPER(e.supervisor_employee_id)) = TRIM(UPPER($1))
+          AND COALESCE(wd.day_status, 'OPEN') <> 'CLOSED'
+        ORDER BY e.employee_id
+        `,
+        [supervisorId, workDate]
+      );
+
+      for (const r of notClosed) {
+        alerts.push({
+          type: "DAY_NOT_CLOSED",
+          severity: "warning",
+          message: `Worker ${r.employee_id}${r.full_name ? " - " + r.full_name : ""} day is not closed`,
+        });
+      }
+    }
+
+    return res.json({
+      success: true,
+      data: {
+        supervisor_id: supervisorId,
+        work_date: workDate,
+        alerts,
+      },
+    });
+  } catch (e) {
+    console.error("[MONITOR] supervisor alerts error:", e);
+    return res.status(500).json({
+      success: false,
+      error: { code: "INTERNAL_ERROR", message: e.message },
+    });
+  }
+});
+
+// ---------- SE alerts ----------
+router.get("/se-alerts", requireAuth, async (req, res) => {
+  try {
+    const workDate = parseISODate(req.query.work_date);
+    const hour = currentHourKSA();
+
+    if (!workDate) {
+      return res.status(400).json({
+        success: false,
+        error: { code: "BAD_REQUEST", message: "work_date required" },
+      });
+    }
+
+    const alerts = [];
+
+    // open sessions
+    const openSessions = await queryMany(
+      `
+      SELECT ts.employee_id, e.full_name, ts.project_id, ts.task_id,
+             e.supervisor_employee_id, sup.full_name AS supervisor_name
+      FROM task_session ts
+      LEFT JOIN employees e ON e.employee_id = ts.employee_id
+      LEFT JOIN employees sup ON sup.employee_id = e.supervisor_employee_id
+      WHERE ts.status='OPEN' AND ts.work_date=$1
+      ORDER BY e.supervisor_employee_id, ts.employee_id
+      `,
+      [workDate]
+    );
+
+    for (const s of openSessions) {
+      alerts.push({
+        type: "OPEN_SESSION",
+        severity: "warning",
+        message:
+          `Open task: ${s.employee_id}${s.full_name ? " - " + s.full_name : ""} on ${s.project_id}/${s.task_id}` +
+          `${s.supervisor_employee_id ? ` • Supervisor ${s.supervisor_employee_id}${s.supervisor_name ? " - " + s.supervisor_name : ""}` : ""}`,
+      });
+    }
+
+    // after 10:00 → workers not scanned
+    if (hour >= 10) {
+      const noScan = await queryMany(
+        `
+        SELECT e.employee_id, e.full_name, e.supervisor_employee_id, sup.full_name AS supervisor_name
+        FROM employees e
+        LEFT JOIN employees sup ON sup.employee_id = e.supervisor_employee_id
+        WHERE NOT EXISTS (
+          SELECT 1
+          FROM assignment_scan a
+          WHERE a.employee_id = e.employee_id
+            AND a.work_date = $1
+            AND a.scan_status = 'Accepted'
+        )
+        ORDER BY e.supervisor_employee_id, e.employee_id
+        `,
+        [workDate]
+      );
+
+      for (const r of noScan) {
+        alerts.push({
+          type: "NO_SCAN",
+          severity: "warning",
+          message:
+            `No scan: ${r.employee_id}${r.full_name ? " - " + r.full_name : ""}` +
+            `${r.supervisor_employee_id ? ` • Supervisor ${r.supervisor_employee_id}${r.supervisor_name ? " - " + r.supervisor_name : ""}` : ""}`,
+        });
+      }
+    }
+
+    // capacity alerts from active releases
+    const capacityRows = await queryMany(
+      `
+      SELECT
+        tr.project_id,
+        tr.task_id,
+        tr.supervisor_employee_id,
+        sup.full_name AS supervisor_name,
+        tr.min_workers,
+        tr.max_workers,
+        COALESCE(ts.current_workers, 0) AS current_workers
+      FROM task_releases tr
+      LEFT JOIN employees sup
+        ON sup.employee_id = tr.supervisor_employee_id
+      LEFT JOIN (
+        SELECT
+          project_id,
+          task_id,
+          COUNT(DISTINCT employee_id)::int AS current_workers
+        FROM task_session
+        WHERE work_date = $1
+          AND status = 'OPEN'
+        GROUP BY project_id, task_id
+      ) ts
+        ON ts.project_id = tr.project_id
+       AND ts.task_id = tr.task_id
+      WHERE tr.release_status = 'ACTIVE'
+      ORDER BY tr.project_id, tr.task_id
+      `,
+      [workDate]
+    );
+
+    for (const r of capacityRows) {
+      const current = Number(r.current_workers || 0);
+      const min = Number(r.min_workers || 0);
+      const max = r.max_workers === null || r.max_workers === undefined ? null : Number(r.max_workers);
+
+      if (current < min) {
+        alerts.push({
+          type: "UNDER_MIN",
+          severity: "warning",
+          message:
+            `Under minimum: ${r.project_id}/${r.task_id} (${current}/${min})` +
+            `${r.supervisor_employee_id ? ` • Supervisor ${r.supervisor_employee_id}${r.supervisor_name ? " - " + r.supervisor_name : ""}` : ""}`,
+        });
+      } else if (max !== null && current === max) {
+        alerts.push({
+          type: "FULL",
+          severity: "info",
+          message:
+            `Full capacity: ${r.project_id}/${r.task_id} (${current}/${max})` +
+            `${r.supervisor_employee_id ? ` • Supervisor ${r.supervisor_employee_id}${r.supervisor_name ? " - " + r.supervisor_name : ""}` : ""}`,
+        });
+      } else if (max !== null && current > max) {
+        alerts.push({
+          type: "OVER_CAPACITY",
+          severity: "warning",
+          message:
+            `Over capacity: ${r.project_id}/${r.task_id} (${current}/${max})` +
+            `${r.supervisor_employee_id ? ` • Supervisor ${r.supervisor_employee_id}${r.supervisor_name ? " - " + r.supervisor_name : ""}` : ""}`,
+        });
+      }
+    }
+
+    // after 19:00 → supervisors with workers not closed
+    if (hour >= 19) {
+      const supervisorNotClosed = await queryMany(
+        `
+        SELECT
+          e.supervisor_employee_id,
+          sup.full_name AS supervisor_name,
+          COUNT(*)::int AS workers_not_closed
+        FROM employees e
+        LEFT JOIN employees sup ON sup.employee_id = e.supervisor_employee_id
+        LEFT JOIN work_day wd
+          ON wd.employee_id = e.employee_id
+         AND wd.work_date = $1
+        WHERE COALESCE(wd.day_status, 'OPEN') <> 'CLOSED'
+          AND e.supervisor_employee_id IS NOT NULL
+        GROUP BY e.supervisor_employee_id, sup.full_name
+        ORDER BY e.supervisor_employee_id
+        `,
+        [workDate]
+      );
+
+      for (const r of supervisorNotClosed) {
+        alerts.push({
+          type: "SUPERVISOR_NOT_CLOSED",
+          severity: "warning",
+          message:
+            `Supervisor ${r.supervisor_employee_id}${r.supervisor_name ? " - " + r.supervisor_name : ""} has ${r.workers_not_closed} worker(s) not closed`,
+        });
+      }
+    }
+
+    return res.json({
+      success: true,
+      data: { work_date: workDate, alerts },
+    });
+  } catch (e) {
+    console.error("[MONITOR] SE alerts error:", e);
+    return res.status(500).json({
+      success: false,
+      error: { code: "INTERNAL_ERROR", message: e.message },
+    });
+  }
+});
 
 module.exports = router;

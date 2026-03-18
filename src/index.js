@@ -29,15 +29,10 @@ try {
 const app = express();
 console.log("[BOOT] index.js loaded from:", __filename);
 
-const seRoutes = require("./routes/se");
-app.use("/api/v1/se", seRoutes);
-
-// monitoring route (for uptime monitors)
-app.use("/api/v1/monitor", require("./routes/monitor"));
-
 // middleware
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
+app.use(express.urlencoded({ extended: true }));
 
 // simple request log
 app.use((req, _res, next) => {
@@ -51,9 +46,19 @@ app.use((req, _res, next) => {
 app.get("/health", (_req, res) => res.json({ ok: true }));
 app.get("/api/v1/health", (_req, res) => res.json({ ok: true }));
 
+// new requirement routes
+app.use("/api/v1/workforce-structure", require("./routes/workforceStructure"));
+app.use("/api/v1/cost-control", require("./routes/costControl"));
+app.use("/api/v1/day-adjustments", require("./routes/dayAdjustments"));
+
+const seRoutes = require("./routes/se");
+app.use("/api/v1/se", seRoutes);
+
+// monitoring route (for uptime monitors)
+app.use("/api/v1/monitor", require("./routes/monitor"));
+
 // Project / admin / work item routes
 console.log("[MOUNT] /api/v1/admin mounted");
-dumpRoutes(app);
 app.use("/api/v1/admin", adminRoutes);
 app.use("/api/v1/projects", require("./routes/projects"));
 app.use("/api/v1", require("./routes/work_items"));
@@ -67,7 +72,7 @@ app.use("/api/v1", require("./routes/work_items"));
 // GET  /api/v1/work-items/:id/history
 app.use("/api/v1/work-items", require("./routes/workItemsControl"));
 
-// routes
+// core routes
 app.use("/api/v1/auth", authRoutes);
 app.use("/api/v1/scans", scansRoutes);
 app.use("/api/v1/approvals", approvalsRoutes);
@@ -78,11 +83,17 @@ app.use("/api/v1/day", dayRoutes);
 // ✅ Phase 3.0 – Task Release Governance
 app.use("/api/v1/task-releases", taskReleasesRoutes);
 
+// dump selected routes after mounts
+dumpRoutes(app);
+
 // JSON 404 for API
 app.use("/api/v1", (req, res) => {
   return res.status(404).json({
     success: false,
-    error: { code: "NOT_FOUND", message: `Route not found: ${req.method} ${req.originalUrl}` },
+    error: {
+      code: "NOT_FOUND",
+      message: `Route not found: ${req.method} ${req.originalUrl}`,
+    },
   });
 });
 
@@ -105,7 +116,12 @@ function dumpRoutes(app) {
     const stack = router?.stack;
 
     if (!stack) {
-      console.log("[ROUTE DUMP] No router stack found. app._router:", !!app._router, "app.router:", !!app.router);
+      console.log(
+        "[ROUTE DUMP] No router stack found. app._router:",
+        !!app._router,
+        "app.router:",
+        !!app.router
+      );
       return;
     }
 
@@ -116,12 +132,17 @@ function dumpRoutes(app) {
         const base = layer?.regexp?.toString?.() || "(base?)";
         for (const h of layer.handle.stack) {
           if (h?.route?.path) {
-            const methods = Object.keys(h.route.methods || {}).join(",").toUpperCase();
+            const methods = Object.keys(h.route.methods || {})
+              .join(",")
+              .toUpperCase();
             const line = `${methods} ${base} -> ${h.route.path}`;
             if (
               line.includes("admin") ||
               line.includes("supervis") ||
-              line.includes("task-releases")
+              line.includes("task-releases") ||
+              line.includes("workforce-structure") ||
+              line.includes("cost-control") ||
+              line.includes("day-adjustments")
             ) {
               console.log(line);
             }
@@ -131,12 +152,17 @@ function dumpRoutes(app) {
 
       // direct route
       if (layer?.route?.path) {
-        const methods = Object.keys(layer.route.methods || {}).join(",").toUpperCase();
+        const methods = Object.keys(layer.route.methods || {})
+          .join(",")
+          .toUpperCase();
         const line = `${methods} ${layer.route.path}`;
         if (
           line.includes("admin") ||
           line.includes("supervis") ||
-          line.includes("task-releases")
+          line.includes("task-releases") ||
+          line.includes("workforce-structure") ||
+          line.includes("cost-control") ||
+          line.includes("day-adjustments")
         ) {
           console.log(line);
         }

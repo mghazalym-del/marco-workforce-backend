@@ -1,6 +1,6 @@
 /**
  * MARCO Workforce - scans.js
- *
+ *  replaced to fix scan issue 
  * Current behavior kept:
  * - auth via requireAuth
  * - DEV-TOKEN fallback
@@ -10,12 +10,15 @@
  * - rebuild task sessions for accepted scans
  * - day closed check
  *
- * Phase 3.0 addition:
- * - validate task_releases before allowing scan
+ * Secure QR support:
+ * - NEW: release_id|work_date
+ * - LEGACY: MARCO|RLS|<release_id>
+ * - OLD fallback: project_id|task_id
+ * - slash fallback: project_id/task_id
+ *
+ * Team validation:
  * - worker can only scan a task released to their supervisor team
- * - support secure QR format: MARCO|RLS|<release_id>
- * - keep old QR format working: project|task
- * - enforce max_workers capacity from task_releases
+ * - compare supervisor ids safely with trim + uppercase
  */
 
 const express = require("express");
@@ -43,6 +46,19 @@ function employeeIdFromAuth(req) {
   return null;
 }
 
+function isIsoDate(s) {
+  return typeof s === "string" && /^\d{4}-\d{2}-\d{2}$/.test(s.trim());
+}
+
+function looksLikeUuid(s) {
+  return typeof s === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(s.trim());
+}
+
+function norm(v) {
+  return String(v || "").trim().toUpperCase();
+}
+
 // --- QR helpers ---
 function parseQrFlexible(qr) {
   if (typeof qr !== "string") return null;
@@ -51,10 +67,18 @@ function parseQrFlexible(qr) {
 
   const parts = s.split("|").map((x) => x.trim());
 
-  // NEW secure QR format: MARCO|RLS|release_id
-  if (parts.length === 3 && parts[0] === "MARCO" && parts[1] === "RLS") {
+  // LEGACY secure QR format: MARCO|RLS|release_id
+  if (parts.length === 3 && parts[0].toUpperCase() === "MARCO" && parts[1].toUpperCase() === "RLS") {
     if (!parts[2]) return null;
     return { release_id: parts[2] };
+  }
+
+  // NEW secure QR format: release_id|work_date
+  if (parts.length === 2 && looksLikeUuid(parts[0]) && isIsoDate(parts[1])) {
+    return {
+      release_id: parts[0],
+      qr_work_date: parts[1],
+    };
   }
 
   // OLD QR fallback: project_id|task_id
@@ -290,8 +314,6 @@ router.post("/batch", requireAuth, async (req, res) => {
     const deviceId = b.device_id || b.deviceId || "unknown";
     const workDateTop = b.work_date || b.workDate || null;
 
-    // IMPORTANT:
-    // do NOT use await here. We only parse/store raw values.
     const scans = rawItems
       .map((it) => {
         if (!it || typeof it !== "object") return null;
@@ -299,12 +321,16 @@ router.post("/batch", requireAuth, async (req, res) => {
         let projectId = it.project_id || it.projectId || null;
         let taskId = it.task_id || it.taskId || null;
         let releaseId = null;
+        let qrWorkDate = null;
 
         if (it.qr) {
           const parsed = parseQrFlexible(String(it.qr));
           if (parsed) {
             if (parsed.release_id) {
               releaseId = parsed.release_id;
+            }
+            if (parsed.qr_work_date) {
+              qrWorkDate = parsed.qr_work_date;
             }
             if (parsed.project_id && parsed.task_id) {
               projectId = parsed.project_id;
@@ -313,7 +339,7 @@ router.post("/batch", requireAuth, async (req, res) => {
           }
         }
 
-        const workDate = it.work_date || it.workDate || workDateTop;
+        const workDate = it.work_date || it.workDate || qrWorkDate || workDateTop;
         const clientRef =
           it.client_reference_id ||
           it.clientReferenceId ||
@@ -441,7 +467,14 @@ router.post("/batch", requireAuth, async (req, res) => {
             continue;
           }
 
-          if (String(rel.supervisor_employee_id || "") !== String(workerSupervisorId)) {
+          console.log("[SCAN TEAM CHECK]", {
+            workerId: employeeId,
+            workerSupervisorId,
+            releaseSupervisorId: rel.supervisor_employee_id,
+            releaseId: rel.release_id,
+          });
+
+          if (norm(rel.supervisor_employee_id) !== norm(workerSupervisorId)) {
             results.push({
               client_reference_id: s.client_reference_id,
               qr: s.qr,
