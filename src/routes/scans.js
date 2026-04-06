@@ -67,28 +67,31 @@ function parseQrFlexible(qr) {
 
   const parts = s.split("|").map((x) => x.trim());
 
-  // LEGACY secure QR format: MARCO|RLS|release_id
-  if (parts.length === 3 && parts[0].toUpperCase() === "MARCO" && parts[1].toUpperCase() === "RLS") {
-    if (!parts[2]) return null;
-    return { release_id: parts[2] };
-  }
-
-  // NEW secure QR format: release_id|work_date
-  if (parts.length === 2 && looksLikeUuid(parts[0]) && isIsoDate(parts[1])) {
+  // 🔥 1. NEW secure QR format: release_id|work_date
+  if (parts.length === 2 && isIsoDate(parts[1])) {
     return {
       release_id: parts[0],
       qr_work_date: parts[1],
     };
   }
 
-  // OLD QR fallback: project_id|task_id
+  // 🔥 2. LEGACY secure QR: MARCO|RLS|release_id
+  if (
+    parts.length === 3 &&
+    parts[0].toUpperCase() === "MARCO" &&
+    parts[1].toUpperCase() === "RLS"
+  ) {
+    return { release_id: parts[2] };
+  }
+
+  // 🔥 3. OLD fallback: project_id|task_id
   if (parts.length === 2) {
     const [project_id, task_id] = parts;
     if (!project_id || !task_id) return null;
     return { project_id, task_id };
   }
 
-  // optional slash fallback
+  // 🔥 4. slash fallback
   if (s.includes("/")) {
     const slashParts = s.split("/").map((x) => x.trim());
     if (slashParts.length === 2) {
@@ -166,9 +169,18 @@ async function getWorkerSupervisorId(client, employeeId) {
   if (r.rowCount === 0) return null;
   return r.rows[0]?.supervisor_employee_id || null;
 }
-
+//ffff
 async function findActiveReleaseForSupervisor(client, projectId, taskId, supervisorEmployeeId) {
   if (!supervisorEmployeeId) return null;
+
+  console.log("[RELEASE LOOKUP INPUT]", {
+    projectId,
+    taskId,
+    supervisorEmployeeId,
+    projectIdNorm: norm(projectId),
+    taskIdNorm: norm(taskId),
+    supervisorNorm: norm(supervisorEmployeeId),
+  });
 
   const r = await client.query(
     `
@@ -184,15 +196,20 @@ async function findActiveReleaseForSupervisor(client, projectId, taskId, supervi
       min_workers,
       max_workers
     FROM task_releases
-    WHERE project_id = $1
-      AND task_id = $2
-      AND supervisor_employee_id = $3
-      AND release_status = 'ACTIVE'
+    WHERE UPPER(TRIM(project_id)) = UPPER(TRIM($1))
+      AND UPPER(TRIM(task_id)) = UPPER(TRIM($2))
+      AND UPPER(TRIM(supervisor_employee_id)) = UPPER(TRIM($3))
+      AND UPPER(TRIM(release_status)) = 'ACTIVE'
     ORDER BY released_at DESC
     LIMIT 1
     `,
-    [projectId, taskId, supervisorEmployeeId]
+    [String(projectId || "").trim(), String(taskId || "").trim(), String(supervisorEmployeeId || "").trim()]
   );
+
+  console.log("[RELEASE LOOKUP RESULT]", {
+    rowCount: r.rowCount,
+    row: r.rowCount > 0 ? r.rows[0] : null,
+  });
 
   return r.rowCount > 0 ? r.rows[0] : null;
 }
@@ -363,8 +380,8 @@ router.post("/batch", requireAuth, async (req, res) => {
             clientRef ||
             `${employeeId || "unknown"}-${workDate}-${projectId || "release"}-${taskId || releaseId}-${Date.now()}`,
           work_date: workDate,
-          project_id: projectId ? String(projectId) : null,
-          task_id: taskId ? String(taskId) : null,
+          project_id: projectId ? String(projectId).trim() : null,
+          task_id: taskId ? String(taskId).trim() : null,
           release_id: releaseId ? String(releaseId) : null,
           scan_timestamp_device: ts,
           is_offline: !!isOffline,
@@ -419,6 +436,10 @@ router.post("/batch", requireAuth, async (req, res) => {
       }
 
       const workerSupervisorId = await getWorkerSupervisorId(client, employeeId);
+      console.log("[WORKER SUPERVISOR LOOKUP]", {
+        employeeId,
+        workerSupervisorId,
+      });
       if (!workerSupervisorId) {
         await client.query("ROLLBACK");
         return res.status(400).json({
@@ -435,83 +456,80 @@ router.post("/batch", requireAuth, async (req, res) => {
 
       for (const s of scans) {
         let activeRelease = null;
-
+        console.log("[SCAN ITEM RAW]", s);
         // NEW secure QR flow:
         // If release_id was scanned, resolve exact release here.
+        // replace because worker scan issue 
+        let rel = null;
+
+        // 🔥 Try release_id first
         if (s.release_id) {
-          const rel = await findReleaseById(client, s.release_id);
+          rel = await findReleaseById(client, s.release_id);
 
-          if (!rel) {
-            results.push({
-              client_reference_id: s.client_reference_id,
-              qr: s.qr,
-              status: "Rejected",
-              error: {
-                code: "INVALID_RELEASE",
-                message: "QR release not found.",
-              },
-            });
-            continue;
+          if (rel && String(rel.release_status || "").toUpperCase() !== "ACTIVE") {
+            rel = null;
           }
+        }
 
-          if (String(rel.release_status || "").toUpperCase() !== "ACTIVE") {
-            results.push({
-              client_reference_id: s.client_reference_id,
-              qr: s.qr,
-              status: "Rejected",
-              error: {
-                code: "RELEASE_INACTIVE",
-                message: "Task release is not active.",
-              },
-            });
-            continue;
-          }
-
-          console.log("[SCAN TEAM CHECK]", {
-            workerId: employeeId,
-            workerSupervisorId,
-            releaseSupervisorId: rel.supervisor_employee_id,
-            releaseId: rel.release_id,
-          });
-
-          if (norm(rel.supervisor_employee_id) !== norm(workerSupervisorId)) {
-            results.push({
-              client_reference_id: s.client_reference_id,
-              qr: s.qr,
-              status: "Rejected",
-              error: {
-                code: "TASK_NOT_RELEASED",
-                message: "Task not released for your team.",
-              },
-            });
-            continue;
-          }
-
-          s.project_id = rel.project_id;
-          s.task_id = rel.task_id;
-          activeRelease = rel;
-        } else {
-          // OLD QR flow
-          activeRelease = await findActiveReleaseForSupervisor(
+        // 🔥 Fallback → find by project/task/supervisor
+        if (!rel) {
+          rel = await findActiveReleaseForSupervisor(
             client,
             s.project_id,
             s.task_id,
             workerSupervisorId
           );
+        }
 
-          if (!activeRelease) {
-            results.push({
-              client_reference_id: s.client_reference_id,
-              qr: s.qr,
-              status: "Rejected",
-              error: {
-                code: "TASK_NOT_RELEASED",
-                message: "Task not released for your team.",
-              },
-            });
-            continue;
+        // 🔥 Last fallback → ANY active release for task
+        if (!rel) {
+          const r2 = await client.query(`
+            SELECT *
+            FROM task_releases
+            WHERE UPPER(TRIM(project_id)) = UPPER(TRIM($1))
+              AND UPPER(TRIM(task_id)) = UPPER(TRIM($2))
+              AND release_status = 'ACTIVE'
+            ORDER BY released_at DESC
+            LIMIT 1
+          `, [s.project_id, s.task_id]);
+
+          if (r2.rowCount > 0) {
+            rel = r2.rows[0];
           }
         }
+
+        // ❌ No release found
+        if (!rel) {
+          results.push({
+            client_reference_id: s.client_reference_id,
+            qr: s.qr,
+            status: "Rejected",
+          error: {
+              code: "TASK_NOT_RELEASED",
+              message: "Task not released for your team.",
+            },
+          });
+          continue;
+        }
+
+        // 🔥 Team validation AFTER finding release
+        if (norm(rel.supervisor_employee_id) !== norm(workerSupervisorId)) {
+          results.push({
+            client_reference_id: s.client_reference_id,
+            qr: s.qr,
+            status: "Rejected",
+            error: {
+              code: "TASK_NOT_RELEASED",
+            message: "Task not assigned to your team.",
+            },
+          });
+          continue;
+        }
+
+        // assign resolved values
+        s.project_id = rel.project_id;
+        s.task_id = rel.task_id;
+        activeRelease = rel;
 
         if (!s.project_id || !s.task_id) {
           results.push({

@@ -68,33 +68,6 @@ router.post("/", requireAuth, async (req, res) => {
       });
     }
 
-    const capacityMin = toNullableInt(min_workers) ?? 0;
-    const capacityMax = toNullableInt(max_workers);
-
-    if (capacityMin < 0) {
-      return res.status(400).json({
-        success: false,
-        error: { code: "INVALID_MIN", message: "min_workers cannot be negative" },
-      });
-    }
-
-    if (capacityMax !== null && capacityMax < 1) {
-      return res.status(400).json({
-        success: false,
-        error: { code: "INVALID_MAX", message: "max_workers must be >= 1" },
-      });
-    }
-
-    if (capacityMax !== null && capacityMax < capacityMin) {
-      return res.status(400).json({
-        success: false,
-        error: {
-          code: "INVALID_CAPACITY",
-          message: "max_workers must be greater than or equal to min_workers",
-        },
-      });
-    }
-
     const actor = await pool.query(
       `
       SELECT employee_id, role, full_name
@@ -116,6 +89,7 @@ router.post("/", requireAuth, async (req, res) => {
     }
 
     const role = String(actor.rows[0].role || "").toUpperCase();
+
     if (!["SE", "PM"].includes(role)) {
       return res.status(403).json({
         success: false,
@@ -126,9 +100,10 @@ router.post("/", requireAuth, async (req, res) => {
       });
     }
 
+    // 🔥 CHECK SUPERVISOR EXISTS
     const sup = await pool.query(
       `
-      SELECT employee_id, role, full_name
+      SELECT employee_id, role, full_name, supervisor_employee_id
       FROM employees
       WHERE employee_id = $1
       LIMIT 1
@@ -146,32 +121,36 @@ router.post("/", requireAuth, async (req, res) => {
       });
     }
 
-    // Prevent duplicate ACTIVE release for same project/task/supervisor
+    const supervisor = sup.rows[0];
+
+    // 🔥 CRITICAL FIX (A4)
+    if (role === "SE") {
+      const supervisorOwner = supervisor.supervisor_employee_id;
+
+      if (String(supervisorOwner) !== String(employeeId)) {
+        return res.status(403).json({
+          success: false,
+          error: {
+            code: "SUPERVISOR_NOT_UNDER_SE",
+            message:
+              "You can only release tasks to supervisors under your supervision",
+          },
+        });
+      }
+    }
+
+    const capacityMin = toNullableInt(min_workers) ?? 0;
+    const capacityMax = toNullableInt(max_workers);
+
+    // 🔁 EXISTING duplicate check (keep)
     const existing = await pool.query(
       `
-      SELECT
-        tr.release_id,
-        tr.project_id,
-        tr.task_id,
-        tr.se_employee_id,
-        se.full_name AS se_name,
-        tr.supervisor_employee_id,
-        sup.full_name AS supervisor_name,
-        tr.release_status,
-        tr.released_at,
-        tr.released_by,
-        tr.min_workers,
-        tr.max_workers
-      FROM task_releases tr
-      LEFT JOIN employees sup
-        ON sup.employee_id = tr.supervisor_employee_id
-      LEFT JOIN employees se
-        ON se.employee_id = tr.se_employee_id
-      WHERE tr.project_id = $1
-        AND tr.task_id = $2
-        AND tr.supervisor_employee_id = $3
-        AND tr.release_status = 'ACTIVE'
-      ORDER BY tr.released_at DESC
+      SELECT release_id
+      FROM task_releases
+      WHERE project_id = $1
+        AND task_id = $2
+        AND supervisor_employee_id = $3
+        AND release_status = 'ACTIVE'
       LIMIT 1
       `,
       [project_id, task_id, supervisor_employee_id]
@@ -182,12 +161,13 @@ router.post("/", requireAuth, async (req, res) => {
         success: false,
         error: {
           code: "ACTIVE_RELEASE_EXISTS",
-          message: "Active release already exists for this supervisor on this task. Close it first.",
+          message:
+            "Active release already exists for this supervisor on this task",
         },
-        data: existing.rows[0],
       });
     }
 
+    // 🔥 INSERT
     const result = await pool.query(
       `
       INSERT INTO task_releases
@@ -202,17 +182,7 @@ router.post("/", requireAuth, async (req, res) => {
         max_workers
       )
       VALUES ($1, $2, $3, $4, 'ACTIVE', $3, $5, $6)
-      RETURNING
-        release_id,
-        project_id,
-        task_id,
-        se_employee_id,
-        supervisor_employee_id,
-        release_status,
-        released_at,
-        released_by,
-        min_workers,
-        max_workers
+      RETURNING *
       `,
       [project_id, task_id, employeeId, supervisor_employee_id, capacityMin, capacityMax]
     );

@@ -598,74 +598,80 @@ router.post("/close-day", requireAuth, async (req, res) => {
  * Returns list of workers for supervisor screens.
  */
 router.get("/workers", requireAuth, async (req, res) => {
+  const supervisorId =
+    req.user?.employee_id || req.employee_id || employeeIdFromAuth(req);
+
+  if (!supervisorId) {
+    return res.status(401).json({
+      success: false,
+      error: { code: "UNAUTHORIZED", message: "Unauthorized" },
+    });
+  }
+
   try {
-    const out = await withClient(async (client) => {
+    const workers = await withClient(async (client) => {
       const q = (t, p) => client.query(t, p);
 
-      // Try full schema first
-      try {
-        const r = await q(
-          `SELECT employee_id, full_name, status
-             FROM employees
-            WHERE COALESCE(is_supervisor,false)=false
-            ORDER BY employee_id`,
-          []
-        );
-        return r.rows;
-      } catch (e) {
-        // Fallback if some columns don't exist (ex: status/is_supervisor)
-        const r2 = await q(
-          `SELECT employee_id, full_name
-             FROM employees
-            ORDER BY employee_id`,
-          []
-        );
-        return r2.rows.map((x) => ({ ...x, status: "Active" }));
-      }
-    });
-
-    console.log(
-      "[SUP ASSIGN] RESPONSE JSON:",
-      JSON.stringify({ success: true, data: { /* same object you return */ } }, null, 2)
-    );
-
-    // --- DEBUG: log ANY response returned by this route (temporary)
-    const _json = res.json.bind(res);
-    const _status = res.status.bind(res);
-
-    res.status = (code) => {
-      res.__statusCode = code;
-      return _status(code);
-    };
-
-    res.json = (body) => {
-      console.log(
-        "[SUP ASSIGN] RESPONSE JSON:",
-        JSON.stringify(
-          { statusCode: res.__statusCode || 200, body },
-          null,
-          2
-        )
+      // 1) Preferred source: project workforce structure
+      const scoped = await q(
+        `
+        SELECT DISTINCT
+          e.employee_id,
+          e.full_name,
+          COALESCE(e.status, 'Active') AS status
+        FROM workforce_project_structure wps
+        JOIN employees e
+          ON e.employee_id = wps.employee_id
+        WHERE wps.reports_to_employee_id = $1
+          AND UPPER(COALESCE(wps.structure_role_code, '')) = 'WORKER'
+          AND COALESCE(wps.is_active, TRUE) = TRUE
+        ORDER BY e.employee_id
+        `,
+        [supervisorId]
       );
-      return _json(body);
-    };
-    // --- END DEBUG
 
-    const _send = res.send.bind(res);
-    res.send = (body) => {
-      try {
-        console.log("[SUP ASSIGN] RESPONSE SEND:", body);
-      } catch {}
-      return _send(body);
-    };
+      if (scoped.rowCount > 0) {
+        return scoped.rows;
+      }
 
+      // 2) Fallback source: employee master hierarchy
+      const fallback = await q(
+        `
+        SELECT
+          employee_id,
+          full_name,
+          COALESCE(status, 'Active') AS status
+        FROM employees
+        WHERE supervisor_employee_id = $1
+          AND UPPER(COALESCE(role, '')) = 'WORKER'
+        ORDER BY employee_id
+        `,
+        [supervisorId]
+      );
 
-
-
-    return res.json(out);
+      return fallback.rows;
+    });
+      /*close this part to avoid the error in desktop after worker flitter issue 
+    return res.json({
+      success: true,
+      data: {
+        supervisor_employee_id: supervisorId,
+        count: workers.length,
+        workers,
+      },
+    });
+    */
+   //Add this line as replacement to the part apove 
+    return res.json(workers);
   } catch (e) {
     console.error("GET /supervisor/workers error:", e);
-    return res.status(500).json({ success: false, error: e.message || "Unexpected error" });
+    return res.status(500).json({
+      success: false,
+      error: {
+        code: "SUPERVISOR_WORKERS_FETCH_FAILED",
+        message: e.message || "Unexpected error",
+      },
+    });
   }
 });
 

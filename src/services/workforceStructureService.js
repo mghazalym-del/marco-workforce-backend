@@ -41,40 +41,23 @@ function buildProjectStructureTree(rows) {
 
   for (const row of rows) {
     nodeMap.set(row.employee_id, {
-      structure_id: row.structure_id,
-      project_id: row.project_id,
-      employee_id: row.employee_id,
-      employee_name: row.employee_name,
-      position_title: row.position_title,
+      ...row,
       role_code: row.structure_role_code,
-      reports_to_employee_id: row.reports_to_employee_id,
-      reports_to_employee_name: row.reports_to_employee_name,
-      hierarchy_level: row.hierarchy_level,
-      valid_from: row.valid_from,
-      valid_to: row.valid_to,
-      is_active: row.is_active,
-      created_at: row.created_at,
-      updated_at: row.updated_at,
-      remarks: row.remarks,
       children: [],
     });
   }
 
   for (const row of rows) {
-    const currentNode = nodeMap.get(row.employee_id);
+    const node = nodeMap.get(row.employee_id);
 
     if (!row.reports_to_employee_id) {
-      roots.push(currentNode);
+      roots.push(node);
       continue;
     }
 
-    const parentNode = nodeMap.get(row.reports_to_employee_id);
-
-    if (parentNode) {
-      parentNode.children.push(currentNode);
-    } else {
-      roots.push(currentNode);
-    }
+    const parent = nodeMap.get(row.reports_to_employee_id);
+    if (parent) parent.children.push(node);
+    else roots.push(node);
   }
 
   return roots;
@@ -82,11 +65,9 @@ function buildProjectStructureTree(rows) {
 
 async function getProjectStructureTree(projectId) {
   const rows = await getProjectStructure(projectId);
-  const tree = buildProjectStructureTree(rows);
-
   return {
     items: rows,
-    tree,
+    tree: buildProjectStructureTree(rows),
   };
 }
 
@@ -112,16 +93,10 @@ async function reassignWorkforceNode({
   try {
     await client.query("BEGIN");
 
+    // --- Child ---
     const childRes = await client.query(
       `
-      SELECT
-        structure_id,
-        project_id,
-        employee_id,
-        structure_role_code,
-        reports_to_employee_id,
-        hierarchy_level,
-        is_active
+      SELECT *
       FROM public.workforce_project_structure
       WHERE project_id = $1
         AND employee_id = $2
@@ -136,14 +111,10 @@ async function reassignWorkforceNode({
 
     const child = childRes.rows[0];
 
+    // --- Parent ---
     const parentRes = await client.query(
       `
-      SELECT
-        structure_id,
-        employee_id,
-        structure_role_code,
-        hierarchy_level,
-        is_active
+      SELECT *
       FROM public.workforce_project_structure
       WHERE project_id = $1
         AND employee_id = $2
@@ -158,6 +129,7 @@ async function reassignWorkforceNode({
 
     const parent = parentRes.rows[0];
 
+    // --- Validation ---
     if (!isAllowedParent(child.structure_role_code, parent.structure_role_code)) {
       throw new Error("INVALID_HIERARCHY_RELATION");
     }
@@ -166,64 +138,77 @@ async function reassignWorkforceNode({
       throw new Error("SELF_REPORTING_NOT_ALLOWED");
     }
 
-    // Prevent cycles
-    const allRowsRes = await client.query(
+    // --- Prevent cycles ---
+    const allRows = await client.query(
       `
       SELECT employee_id, reports_to_employee_id
       FROM public.workforce_project_structure
-      WHERE project_id = $1
-        AND is_active = TRUE
+      WHERE project_id = $1 AND is_active = TRUE
       `,
       [project_id]
     );
 
-    const rows = allRowsRes.rows;
-
-    const descendantsMap = new Map();
-    for (const row of rows) {
-      const managerId = row.reports_to_employee_id;
-      if (!managerId) continue;
-      if (!descendantsMap.has(managerId)) descendantsMap.set(managerId, []);
-      descendantsMap.get(managerId).push(row.employee_id);
+    const map = new Map();
+    for (const r of allRows.rows) {
+      if (!r.reports_to_employee_id) continue;
+      if (!map.has(r.reports_to_employee_id)) map.set(r.reports_to_employee_id, []);
+      map.get(r.reports_to_employee_id).push(r.employee_id);
     }
 
-    const stack = [...(descendantsMap.get(child.employee_id) || [])];
-    const descendants = new Set();
+    const stack = [...(map.get(child.employee_id) || [])];
+    const visited = new Set();
 
-    while (stack.length > 0) {
-      const current = stack.pop();
-      if (!current || descendants.has(current)) continue;
-      descendants.add(current);
-      const next = descendantsMap.get(current) || [];
-      stack.push(...next);
+    while (stack.length) {
+      const cur = stack.pop();
+      if (!cur || visited.has(cur)) continue;
+      visited.add(cur);
+      stack.push(...(map.get(cur) || []));
     }
 
-    if (descendants.has(parent.employee_id)) {
+    if (visited.has(parent.employee_id)) {
       throw new Error("CYCLE_NOT_ALLOWED");
     }
 
-    const newHierarchyLevel = Number(parent.hierarchy_level) + 1;
+    const newLevel = Number(parent.hierarchy_level) + 1;
 
+    // --- UPDATE STRUCTURE ---
     await client.query(
       `
       UPDATE public.workforce_project_structure
-      SET
-        reports_to_employee_id = $1,
-        hierarchy_level = $2,
-        updated_at = NOW(),
-        updated_by = $3
+      SET reports_to_employee_id = $1,
+          hierarchy_level = $2,
+          updated_at = NOW(),
+          updated_by = $3
       WHERE project_id = $4
         AND employee_id = $5
         AND is_active = TRUE
       `,
       [
         new_reports_to_employee_id,
-        newHierarchyLevel,
+        newLevel,
         updated_by || null,
         project_id,
         employee_id,
       ]
     );
+
+    // 🔥🔥🔥 CRITICAL FIX HERE 🔥🔥🔥
+    // Sync employees table if WORKER moved under SUPERVISOR
+    if (child.structure_role_code === "WORKER") {
+      await client.query(
+        `
+        UPDATE public.employees
+        SET supervisor_employee_id = $1
+        WHERE employee_id = $2
+        `,
+        [new_reports_to_employee_id, employee_id]
+      );
+
+      console.log("[WORKFORCE SYNC] Updated employee supervisor", {
+        employee_id,
+        new_supervisor: new_reports_to_employee_id,
+      });
+    }
 
     await client.query("COMMIT");
 
@@ -232,8 +217,7 @@ async function reassignWorkforceNode({
       project_id,
       employee_id,
       new_reports_to_employee_id,
-      updated_by: updated_by || null,
-      new_hierarchy_level: newHierarchyLevel,
+      new_hierarchy_level: newLevel,
     };
   } catch (err) {
     await client.query("ROLLBACK");
