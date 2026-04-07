@@ -12,30 +12,46 @@ async function validateDailyCost({ project_id, from, to }) {
   try {
     const result = await client.query(
       `
-      SELECT 
-        wd.employee_id,
+      WITH candidate_days AS (
+        SELECT DISTINCT
+          ts.employee_id,
+          ts.work_date,
+          ts.project_id
+        FROM task_session ts
+        WHERE ts.project_id = $1
+          AND ts.work_date BETWEEN $2 AND $3
+      )
+      SELECT
+        cd.employee_id,
         e.full_name AS employee_name,
-        wd.work_date,
-        wd.day_status,
-        COUNT(ts.*) FILTER (WHERE ts.status = 'OPEN') AS open_sessions,
+        cd.work_date,
+        COALESCE(wd.day_status, 'OPEN') AS day_status,
+
+        (
+          SELECT COUNT(*)
+          FROM task_session ts2
+          WHERE ts2.employee_id = cd.employee_id
+            AND ts2.work_date = cd.work_date
+            AND ts2.project_id = cd.project_id
+            AND UPPER(COALESCE(ts2.status, 'OPEN')) = 'OPEN'
+        ) AS open_sessions,
 
         EXISTS (
-          SELECT 1 FROM worker_day_adjustment_option2_hdr hdr
-          WHERE hdr.employee_id = wd.employee_id
-          AND hdr.work_date = wd.work_date
-          AND hdr.project_id = $1
+          SELECT 1
+          FROM worker_day_adjustment_run r
+          WHERE r.employee_id = cd.employee_id
+            AND r.work_date = cd.work_date
+            AND r.project_id = cd.project_id
         ) AS already_generated
 
-      FROM work_day wd
-      JOIN employees e ON e.employee_id = wd.employee_id
-      LEFT JOIN task_session ts 
-        ON ts.employee_id = wd.employee_id
-        AND ts.work_date = wd.work_date
+      FROM candidate_days cd
+      LEFT JOIN employees e
+        ON e.employee_id = cd.employee_id
+      LEFT JOIN work_day wd
+        ON wd.employee_id = cd.employee_id
+      AND wd.work_date = cd.work_date
 
-      WHERE wd.work_date BETWEEN $2 AND $3
-
-      GROUP BY wd.employee_id, e.full_name, wd.work_date, wd.day_status
-      ORDER BY wd.work_date, wd.employee_id
+      ORDER BY cd.work_date, cd.employee_id
       `,
       [project_id, from, to]
     );
