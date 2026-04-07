@@ -80,4 +80,86 @@ router.post("/validate", requireAuth, async (req, res) => {
   }
 });
 
+router.post("/generate", requireAuth, async (req, res) => {
+  try {
+    const actorId = employeeIdFromAuth(req);
+
+    if (!actorId) {
+      return res.status(401).json({
+        success: false,
+        error: {
+          code: "UNAUTHORIZED",
+          message: "Unauthorized",
+        },
+      });
+    }
+
+    const {
+      project_id,
+      cost_month,
+      option_type,
+    } = req.body || {};
+
+    const data = await service.generateMonthlyCost({
+      project_id,
+      cost_month,
+      option_type,
+      actor_id: actorId,
+    });
+
+    if (!data.ready) {
+      return res.status(409).json({
+        success: false,
+        error: {
+          code: "MONTHLY_COST_BLOCKED",
+          message: "Monthly cost generation is blocked by validation issues.",
+        },
+        data,
+      });
+    }
+
+    return res.json({
+      success: true,
+      data,
+    });
+  } catch (err) {
+    console.error("[monthly-cost][POST /generate] error:", err);
+
+    const msg = String(err.message || "");
+
+    if (
+      msg.includes("project_id is required") ||
+      msg.includes("cost_month must be first day of month") ||
+      msg.includes("option_type must be OPTION1 or OPTION2") ||
+      msg.includes("actor_id is required")
+    ) {
+      return res.status(400).json({
+        success: false,
+        error: {
+          code: "VALIDATION_ERROR",
+          message: msg,
+        },
+      });
+    }
+
+    if (msg.includes("Batch is already in status")) {
+      return res.status(409).json({
+        success: false,
+        error: {
+          code: "BATCH_STATUS_BLOCKED",
+          message: msg,
+        },
+      });
+    }
+
+    return res.status(500).json({
+      success: false,
+      error: {
+        code: "MONTHLY_COST_GENERATE_FAILED",
+        message: "Failed to generate monthly cost batch.",
+      },
+    });
+  }
+});
+
 module.exports = router;
