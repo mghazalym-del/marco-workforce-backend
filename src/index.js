@@ -19,6 +19,8 @@ const adminRoutes = require("./routes/admin");
 const taskReleasesRoutes = require("./routes/taskReleases");
 const seRoutes = require("./routes/se");
 
+const monthlyCostRoutes = require("./routes/monthlyCost");
+
 const oraclePpmSyncRoutes = require("./routes/oraclePpmSync");
 const { startOracleSyncJob } = require("./jobs/oraclePpmSyncJob");
 // Optional background jobs folder exists, but do not fail if job module not present.
@@ -68,6 +70,8 @@ app.use(cors(corsOptions));
 // INTEGRATION 
 app.use("/api/v1/oracle", oraclePpmSyncRoutes);
 
+// New cost proccess (monthly Cost)
+app.use("/api/v1/monthly-cost", monthlyCostRoutes);
 
 startOracleSyncJob();
 // ----- Core middleware -----
