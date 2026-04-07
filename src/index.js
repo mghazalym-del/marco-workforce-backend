@@ -67,6 +67,8 @@ const corsOptions = {
 // IMPORTANT: CORS must be before routes
 app.use(cors(corsOptions));
 
+app.use(express.json({ limit: "1mb" }));
+app.use(express.urlencoded({ extended: true }));
 // INTEGRATION 
 app.use("/api/v1/oracle", oraclePpmSyncRoutes);
 
@@ -75,8 +77,7 @@ app.use("/api/v1/monthly-cost", monthlyCostRoutes);
 
 startOracleSyncJob();
 // ----- Core middleware -----
-app.use(express.json({ limit: "1mb" }));
-app.use(express.urlencoded({ extended: true }));
+
 
 // simple request log
 app.use((req, _res, next) => {
@@ -89,11 +90,12 @@ app.use((req, _res, next) => {
 // health
 app.get("/health", (_req, res) => res.json({ ok: true }));
 app.get("/api/v1/health", (_req, res) => res.json({ ok: true }));
-
+app.use("/api/v1/daily-cost", require("./routes/dailyCost"));
 // new requirement routes
 app.use("/api/v1/workforce-structure", require("./routes/workforceStructure"));
 app.use("/api/v1/cost-control", require("./routes/costControl"));
 app.use("/api/v1/day-adjustments", require("./routes/dayAdjustments"));
+
 
 // SE routes
 console.log(

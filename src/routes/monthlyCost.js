@@ -23,6 +23,8 @@ function employeeIdFromAuth(req) {
 
 router.post("/validate", requireAuth, async (req, res) => {
   try {
+    console.log("[MONTHLY COST VALIDATE BODY]", req.body);
+
     const actorId = employeeIdFromAuth(req);
 
     if (!actorId) {
@@ -40,6 +42,12 @@ router.post("/validate", requireAuth, async (req, res) => {
       cost_month,
       option_type,
     } = req.body || {};
+
+    console.log("[MONTHLY COST VALIDATE VALUES]", {
+      project_id,
+      cost_month,
+      option_type,
+    });
 
     const data = await service.validateMonthlyCost({
       project_id,
