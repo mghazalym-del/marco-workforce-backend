@@ -300,9 +300,13 @@ router.get("/supervisors", requireAuth, async (req, res) => {
   try {
     const rows = await queryMany(
       `
-      SELECT employee_id, full_name, status
+     SELECT employee_id, full_name, role, status
       FROM employees
-      WHERE is_supervisor = TRUE AND (status='Active' OR status IS NULL)
+      WHERE UPPER(role) IN ('ADMIN', 'SUPERVISOR')
+        AND (
+          status IS NULL
+          OR UPPER(TRIM(status)) = 'ACTIVE'
+        )
       ORDER BY employee_id
       `,
       []
