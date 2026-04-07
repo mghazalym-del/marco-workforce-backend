@@ -48,7 +48,7 @@ function requireAnyDb(roles) {
 router.get(
   "/",
   requireAuth,
-  requireAnyDb(["ADMIN", "PM", "SE"]),
+  requireAnyDb(["ADMIN", "PM", "SE", "COST_CONTROLLER"]),
   async (req, res) => {
     try {
       const q = await pool.query(

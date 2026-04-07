@@ -4,6 +4,20 @@ const router = express.Router();
 const requireAuth = require("../middleware/requireAuth");
 const service = require("../services/monthlyCostService");
 
+function requireCostAccess(req, res) {
+  const role = req.user?.role;
+
+  if (!['PM', 'COST_CONTROLLER'].includes(role)) {
+    return res.status(403).json({
+      success: false,
+      error: { code: 'FORBIDDEN', message: 'Insufficient role' }
+    });
+  }
+
+  return null;
+}
+
+
 function employeeIdFromAuth(req) {
   const direct =
     req.employee_id ||
@@ -23,6 +37,8 @@ function employeeIdFromAuth(req) {
 
 router.post("/validate", requireAuth, async (req, res) => {
   try {
+    const deny = requireCostAccess(req, res);
+    if (deny) return deny;
     const actorId = employeeIdFromAuth(req);
 
     if (!actorId) {
@@ -69,6 +85,8 @@ router.post("/validate", requireAuth, async (req, res) => {
 
 router.post("/generate", requireAuth, async (req, res) => {
   try {
+    const deny = requireCostAccess(req, res);
+    if (deny) return deny;
     const actorId = employeeIdFromAuth(req);
 
     if (!actorId) {
@@ -135,6 +153,8 @@ router.post("/generate", requireAuth, async (req, res) => {
 
 router.get("/batches", requireAuth, async (req, res) => {
   try {
+    const deny = requireCostAccess(req, res);
+    if (deny) return deny;
     const data = await service.listBatches({
       project_id: req.query.project_id || null,
       cost_month: req.query.cost_month || null,
@@ -157,6 +177,8 @@ router.get("/batches", requireAuth, async (req, res) => {
 
 router.get("/batches/:batch_id", requireAuth, async (req, res) => {
   try {
+    const deny = requireCostAccess(req, res);
+    if (deny) return deny;
     const data = await service.getBatchDetail(req.params.batch_id);
     return res.json({ success: true, data });
   } catch (err) {

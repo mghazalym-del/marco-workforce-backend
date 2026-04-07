@@ -34,9 +34,9 @@ module.exports = async function requireAuth(req, res, next) {
 
     // Load employee profile (same table used in auth.js)
     const q = await pool.query(
-      `SELECT employee_id, full_name, is_supervisor, status
-       FROM employees
-       WHERE employee_id = $1`,
+      `SELECT employee_id, full_name, role, is_supervisor, status
+      FROM employees
+      WHERE employee_id = $1`,
       [employee_id]
     );
 
