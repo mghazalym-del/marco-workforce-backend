@@ -745,4 +745,77 @@ router.get("/se-alerts", requireAuth, async (req, res) => {
   }
 });
 
+/**
+ * GET /api/v1/monitor/activity?work_date=YYYY-MM-DD&limit=200
+ * Detailed activity log (row-level)
+ */
+router.get("/activity", requireAuth, async (req, res) => {
+  try {
+    const workDate = parseISODate(req.query.work_date);
+    const limit = Math.min(Math.max(asInt(req.query.limit, 200), 1), 1000);
+
+    if (!workDate) {
+      return res.status(400).json({
+        success: false,
+        error: { code: "BAD_REQUEST", message: "work_date must be YYYY-MM-DD" },
+      });
+    }
+
+    const rows = await queryMany(
+      `
+      SELECT
+        a.scan_id,
+        a.work_date,
+        a.scan_timestamp_server,
+        a.scan_timestamp_device,
+        a.scan_status,
+
+        w.employee_id AS worker_id,
+        w.full_name   AS worker_name,
+
+        sup.employee_id AS supervisor_id,
+        sup.full_name   AS supervisor_name,
+
+        a.project_id,
+        a.task_id,
+
+        wi.item_code AS task_code,
+        wi.name      AS task_name
+
+      FROM assignment_scan a
+
+      LEFT JOIN employees w
+        ON w.employee_id = a.employee_id
+
+      LEFT JOIN employees sup
+        ON sup.employee_id = w.supervisor_employee_id
+
+      LEFT JOIN work_items wi
+        ON wi.project_code = a.project_id
+       AND wi.item_code = a.task_id
+
+      WHERE a.work_date = $1
+
+      ORDER BY
+        COALESCE(a.scan_timestamp_server, a.scan_timestamp_device) DESC,
+        a.scan_id DESC
+
+      LIMIT ${limit}
+      `,
+      [workDate]
+    );
+
+    return res.json({
+      success: true,
+      data: { activities: rows },
+    });
+  } catch (e) {
+    console.error("[MONITOR] activity error:", e);
+    return res.status(500).json({
+      success: false,
+      error: { code: "INTERNAL_ERROR", message: e.message },
+    });
+  }
+});
+
 module.exports = router;
