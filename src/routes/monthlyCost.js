@@ -23,31 +23,16 @@ function employeeIdFromAuth(req) {
 
 router.post("/validate", requireAuth, async (req, res) => {
   try {
-    console.log("[MONTHLY COST VALIDATE BODY]", req.body);
-
     const actorId = employeeIdFromAuth(req);
 
     if (!actorId) {
       return res.status(401).json({
         success: false,
-        error: {
-          code: "UNAUTHORIZED",
-          message: "Unauthorized",
-        },
+        error: { code: "UNAUTHORIZED", message: "Unauthorized" },
       });
     }
 
-    const {
-      project_id,
-      cost_month,
-      option_type,
-    } = req.body || {};
-
-    console.log("[MONTHLY COST VALIDATE VALUES]", {
-      project_id,
-      cost_month,
-      option_type,
-    });
+    const { project_id, cost_month, option_type } = req.body || {};
 
     const data = await service.validateMonthlyCost({
       project_id,
@@ -55,10 +40,7 @@ router.post("/validate", requireAuth, async (req, res) => {
       option_type,
     });
 
-    return res.json({
-      success: true,
-      data,
-    });
+    return res.json({ success: true, data });
   } catch (err) {
     console.error("[monthly-cost][POST /validate] error:", err);
 
@@ -71,10 +53,7 @@ router.post("/validate", requireAuth, async (req, res) => {
     ) {
       return res.status(400).json({
         success: false,
-        error: {
-          code: "VALIDATION_ERROR",
-          message: msg,
-        },
+        error: { code: "VALIDATION_ERROR", message: msg },
       });
     }
 
@@ -95,18 +74,11 @@ router.post("/generate", requireAuth, async (req, res) => {
     if (!actorId) {
       return res.status(401).json({
         success: false,
-        error: {
-          code: "UNAUTHORIZED",
-          message: "Unauthorized",
-        },
+        error: { code: "UNAUTHORIZED", message: "Unauthorized" },
       });
     }
 
-    const {
-      project_id,
-      cost_month,
-      option_type,
-    } = req.body || {};
+    const { project_id, cost_month, option_type } = req.body || {};
 
     const data = await service.generateMonthlyCost({
       project_id,
@@ -126,10 +98,7 @@ router.post("/generate", requireAuth, async (req, res) => {
       });
     }
 
-    return res.json({
-      success: true,
-      data,
-    });
+    return res.json({ success: true, data });
   } catch (err) {
     console.error("[monthly-cost][POST /generate] error:", err);
 
@@ -143,20 +112,14 @@ router.post("/generate", requireAuth, async (req, res) => {
     ) {
       return res.status(400).json({
         success: false,
-        error: {
-          code: "VALIDATION_ERROR",
-          message: msg,
-        },
+        error: { code: "VALIDATION_ERROR", message: msg },
       });
     }
 
     if (msg.includes("Batch is already in status")) {
       return res.status(409).json({
         success: false,
-        error: {
-          code: "BATCH_STATUS_BLOCKED",
-          message: msg,
-        },
+        error: { code: "BATCH_STATUS_BLOCKED", message: msg },
       });
     }
 
@@ -165,6 +128,184 @@ router.post("/generate", requireAuth, async (req, res) => {
       error: {
         code: "MONTHLY_COST_GENERATE_FAILED",
         message: "Failed to generate monthly cost batch.",
+      },
+    });
+  }
+});
+
+router.get("/batches", requireAuth, async (req, res) => {
+  try {
+    const data = await service.listBatches({
+      project_id: req.query.project_id || null,
+      cost_month: req.query.cost_month || null,
+      option_type: req.query.option_type || null,
+      status: req.query.status || null,
+    });
+
+    return res.json({ success: true, data });
+  } catch (err) {
+    console.error("[monthly-cost][GET /batches] error:", err);
+    return res.status(500).json({
+      success: false,
+      error: {
+        code: "MONTHLY_COST_BATCHES_FAILED",
+        message: "Failed to load monthly cost batches.",
+      },
+    });
+  }
+});
+
+router.get("/batches/:batch_id", requireAuth, async (req, res) => {
+  try {
+    const data = await service.getBatchDetail(req.params.batch_id);
+    return res.json({ success: true, data });
+  } catch (err) {
+    console.error("[monthly-cost][GET /batches/:batch_id] error:", err);
+    if (String(err.message || "") === "BATCH_NOT_FOUND") {
+      return res.status(404).json({
+        success: false,
+        error: { code: "BATCH_NOT_FOUND", message: "Batch not found." },
+      });
+    }
+
+    return res.status(500).json({
+      success: false,
+      error: {
+        code: "MONTHLY_COST_BATCH_DETAIL_FAILED",
+        message: "Failed to load monthly cost batch detail.",
+      },
+    });
+  }
+});
+
+router.post("/batches/:batch_id/submit", requireAuth, async (req, res) => {
+  try {
+    const actorId = employeeIdFromAuth(req);
+    const data = await service.submitBatch({
+      batch_id: req.params.batch_id,
+      actor_id: actorId,
+    });
+
+    return res.json({ success: true, data });
+  } catch (err) {
+    console.error("[monthly-cost][POST /submit] error:", err);
+    const msg = String(err.message || "");
+
+    if (msg === "BATCH_NOT_FOUND") {
+      return res.status(404).json({
+        success: false,
+        error: { code: "BATCH_NOT_FOUND", message: "Batch not found." },
+      });
+    }
+
+    if (msg.startsWith("BATCH_SUBMIT_INVALID_STATUS:")) {
+      return res.status(409).json({
+        success: false,
+        error: {
+          code: "BATCH_SUBMIT_INVALID_STATUS",
+          message: `Batch cannot be submitted from current status.`,
+        },
+      });
+    }
+
+    return res.status(500).json({
+      success: false,
+      error: {
+        code: "MONTHLY_COST_SUBMIT_FAILED",
+        message: "Failed to submit monthly cost batch.",
+      },
+    });
+  }
+});
+
+router.post("/batches/:batch_id/approve", requireAuth, async (req, res) => {
+  try {
+    const actorId = employeeIdFromAuth(req);
+    const { comments = null } = req.body || {};
+
+    const data = await service.approveBatch({
+      batch_id: req.params.batch_id,
+      actor_id: actorId,
+      comments,
+    });
+
+    return res.json({ success: true, data });
+  } catch (err) {
+    console.error("[monthly-cost][POST /approve] error:", err);
+    const msg = String(err.message || "");
+
+    if (msg === "BATCH_NOT_FOUND") {
+      return res.status(404).json({
+        success: false,
+        error: { code: "BATCH_NOT_FOUND", message: "Batch not found." },
+      });
+    }
+
+    if (msg.startsWith("BATCH_APPROVE_INVALID_STATUS:")) {
+      return res.status(409).json({
+        success: false,
+        error: {
+          code: "BATCH_APPROVE_INVALID_STATUS",
+          message: `Batch cannot be approved from current status.`,
+        },
+      });
+    }
+
+    return res.status(500).json({
+      success: false,
+      error: {
+        code: "MONTHLY_COST_APPROVE_FAILED",
+        message: "Failed to approve monthly cost batch.",
+      },
+    });
+  }
+});
+
+router.post("/batches/:batch_id/reject", requireAuth, async (req, res) => {
+  try {
+    const actorId = employeeIdFromAuth(req);
+    const { reason } = req.body || {};
+
+    const data = await service.rejectBatch({
+      batch_id: req.params.batch_id,
+      actor_id: actorId,
+      reason,
+    });
+
+    return res.json({ success: true, data });
+  } catch (err) {
+    console.error("[monthly-cost][POST /reject] error:", err);
+    const msg = String(err.message || "");
+
+    if (msg === "BATCH_NOT_FOUND") {
+      return res.status(404).json({
+        success: false,
+        error: { code: "BATCH_NOT_FOUND", message: "Batch not found." },
+      });
+    }
+
+    if (msg === "reason is required") {
+      return res.status(400).json({
+        success: false,
+        error: { code: "REJECT_REASON_REQUIRED", message: "Reject reason is required." },
+      });
+    }
+
+    if (msg.startsWith("BATCH_REJECT_INVALID_STATUS:")) {
+      return res.status(409).json({
+        success: false,
+        error: {
+          code: "BATCH_REJECT_INVALID_STATUS",
+          message: `Batch cannot be rejected from current status.`,
+        },
+      });
+    }
+
+    return res.status(500).json({
+      success: false,
+      error: {
+        code: "MONTHLY_COST_REJECT_FAILED",
+        message: "Failed to reject monthly cost batch.",
       },
     });
   }

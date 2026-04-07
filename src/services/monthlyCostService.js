@@ -306,8 +306,9 @@ async function upsertBatch(client, { project_id, cost_month, option_type, actor_
 
   if (existing.rowCount > 0) {
     const batch = existing.rows[0];
+    const status = String(batch.status || "").toUpperCase();
 
-    if (["SUBMITTED", "PM_APPROVED", "FINALIZED"].includes(String(batch.status || "").toUpperCase())) {
+    if (["SUBMITTED", "PM_APPROVED", "FINALIZED"].includes(status)) {
       throw new Error(`Batch is already in status ${batch.status} and cannot be regenerated`);
     }
 
@@ -436,9 +437,9 @@ async function insertOption1BatchItems(client, { batch_id, project_id, from, to 
       r.work_date,
       r.project_id,
       'OPTION1' AS option_type,
-      COALESCE(r.original_total_minutes, 0)::numeric(12,2) AS original_total_minutes,
-      COALESCE(h.added_to_last_task_minutes, 0)::numeric(12,2) AS added_or_distributed_minutes,
-      COALESCE(h.adjusted_total_minutes, 0)::numeric(12,2) AS adjusted_total_minutes
+      COALESCE(r.original_total_minutes, 0)::numeric(12,2),
+      COALESCE(h.added_to_last_task_minutes, 0)::numeric(12,2),
+      COALESCE(h.adjusted_total_minutes, 0)::numeric(12,2)
     FROM public.worker_day_adjustment_run r
     JOIN public.worker_day_adjustment_option1_hdr h
       ON h.adjustment_run_id = r.adjustment_run_id
@@ -473,9 +474,9 @@ async function insertOption2BatchItems(client, { batch_id, project_id, from, to 
       r.work_date,
       r.project_id,
       'OPTION2' AS option_type,
-      COALESCE(r.original_total_minutes, 0)::numeric(12,2) AS original_total_minutes,
-      COALESCE(h.distributed_minutes_per_task, 0)::numeric(12,2) AS added_or_distributed_minutes,
-      COALESCE(h.adjusted_total_minutes, 0)::numeric(12,2) AS adjusted_total_minutes
+      COALESCE(r.original_total_minutes, 0)::numeric(12,2),
+      COALESCE(h.distributed_minutes_per_task, 0)::numeric(12,2),
+      COALESCE(h.adjusted_total_minutes, 0)::numeric(12,2)
     FROM public.worker_day_adjustment_run r
     JOIN public.worker_day_adjustment_option2_hdr h
       ON h.adjustment_run_id = r.adjustment_run_id
@@ -632,7 +633,294 @@ async function generateMonthlyCost({
   }
 }
 
+async function listBatches({ project_id = null, cost_month = null, option_type = null, status = null }) {
+  const clauses = [];
+  const params = [];
+
+  if (project_id) {
+    params.push(project_id);
+    clauses.push(`b.project_id = $${params.length}`);
+  }
+
+  if (cost_month) {
+    params.push(cost_month);
+    clauses.push(`b.cost_month = $${params.length}`);
+  }
+
+  if (option_type) {
+    params.push(String(option_type).toUpperCase());
+    clauses.push(`b.option_type = $${params.length}`);
+  }
+
+  if (status) {
+    params.push(String(status).toUpperCase());
+    clauses.push(`b.status = $${params.length}`);
+  }
+
+  const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+
+  return queryMany(
+    `
+    SELECT
+      b.batch_id,
+      b.project_id,
+      b.cost_month,
+      b.option_type,
+      b.status,
+      b.generated_by,
+      b.generated_at,
+      b.submitted_by,
+      b.submitted_at,
+      b.approved_by,
+      b.approved_at,
+      b.returned_by,
+      b.returned_at,
+      b.return_reason,
+      b.locked_at,
+      b.created_at,
+      b.updated_at,
+      COUNT(i.batch_item_id)::int AS item_count
+    FROM public.monthly_cost_batch b
+    LEFT JOIN public.monthly_cost_batch_item i
+      ON i.batch_id = b.batch_id
+    ${where}
+    GROUP BY
+      b.batch_id, b.project_id, b.cost_month, b.option_type, b.status,
+      b.generated_by, b.generated_at, b.submitted_by, b.submitted_at,
+      b.approved_by, b.approved_at, b.returned_by, b.returned_at,
+      b.return_reason, b.locked_at, b.created_at, b.updated_at
+    ORDER BY b.cost_month DESC, b.created_at DESC
+    `,
+    params
+  );
+}
+
+async function getBatchDetail(batch_id) {
+  const batch = await queryOne(
+    `
+    SELECT *
+    FROM public.monthly_cost_batch
+    WHERE batch_id = $1
+    `,
+    [batch_id]
+  );
+
+  if (!batch) {
+    throw new Error("BATCH_NOT_FOUND");
+  }
+
+  const items = await queryMany(
+    `
+    SELECT *
+    FROM public.monthly_cost_batch_item
+    WHERE batch_id = $1
+    ORDER BY work_date ASC, employee_id ASC
+    `,
+    [batch_id]
+  );
+
+  const issues = await queryMany(
+    `
+    SELECT *
+    FROM public.monthly_cost_validation_issue
+    WHERE batch_id = $1
+    ORDER BY work_date ASC NULLS FIRST, employee_id ASC NULLS FIRST
+    `,
+    [batch_id]
+  );
+
+  const history = await queryMany(
+    `
+    SELECT *
+    FROM public.monthly_cost_approval_history
+    WHERE batch_id = $1
+    ORDER BY created_at ASC
+    `,
+    [batch_id]
+  );
+
+  const totals = await queryOne(
+    `
+    SELECT
+      COUNT(*)::int AS item_count,
+      COALESCE(SUM(original_total_minutes), 0)::numeric(12,2) AS original_total_minutes,
+      COALESCE(SUM(added_or_distributed_minutes), 0)::numeric(12,2) AS added_or_distributed_minutes,
+      COALESCE(SUM(adjusted_total_minutes), 0)::numeric(12,2) AS adjusted_total_minutes
+    FROM public.monthly_cost_batch_item
+    WHERE batch_id = $1
+    `,
+    [batch_id]
+  );
+
+  return {
+    batch,
+    totals,
+    items,
+    issues,
+    history,
+  };
+}
+
+async function submitBatch({ batch_id, actor_id }) {
+  if (!actor_id) throw new Error("actor_id is required");
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const batch = await client.query(
+      `SELECT * FROM public.monthly_cost_batch WHERE batch_id = $1 FOR UPDATE`,
+      [batch_id]
+    );
+
+    if (batch.rowCount === 0) throw new Error("BATCH_NOT_FOUND");
+
+    const row = batch.rows[0];
+    const status = String(row.status || "").toUpperCase();
+
+    if (!["GENERATED", "PM_RETURNED"].includes(status)) {
+      throw new Error(`BATCH_SUBMIT_INVALID_STATUS:${status}`);
+    }
+
+    await client.query(
+      `
+      UPDATE public.monthly_cost_batch
+      SET status = 'SUBMITTED',
+          submitted_by = $2,
+          submitted_at = NOW(),
+          updated_at = NOW()
+      WHERE batch_id = $1
+      `,
+      [batch_id, actor_id]
+    );
+
+    await insertHistory(client, {
+      batch_id,
+      action: "SUBMITTED",
+      actor_id,
+      comments: "Submitted to PM for approval",
+    });
+
+    await client.query("COMMIT");
+    return getBatchDetail(batch_id);
+  } catch (e) {
+    await client.query("ROLLBACK");
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+async function approveBatch({ batch_id, actor_id, comments = null }) {
+  if (!actor_id) throw new Error("actor_id is required");
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const batch = await client.query(
+      `SELECT * FROM public.monthly_cost_batch WHERE batch_id = $1 FOR UPDATE`,
+      [batch_id]
+    );
+
+    if (batch.rowCount === 0) throw new Error("BATCH_NOT_FOUND");
+
+    const row = batch.rows[0];
+    const status = String(row.status || "").toUpperCase();
+
+    if (status !== "SUBMITTED") {
+      throw new Error(`BATCH_APPROVE_INVALID_STATUS:${status}`);
+    }
+
+    await client.query(
+      `
+      UPDATE public.monthly_cost_batch
+      SET status = 'PM_APPROVED',
+          approved_by = $2,
+          approved_at = NOW(),
+          locked_at = NOW(),
+          updated_at = NOW()
+      WHERE batch_id = $1
+      `,
+      [batch_id, actor_id]
+    );
+
+    await insertHistory(client, {
+      batch_id,
+      action: "PM_APPROVED",
+      actor_id,
+      comments: comments || "Approved by PM",
+    });
+
+    await client.query("COMMIT");
+    return getBatchDetail(batch_id);
+  } catch (e) {
+    await client.query("ROLLBACK");
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+async function rejectBatch({ batch_id, actor_id, reason }) {
+  if (!actor_id) throw new Error("actor_id is required");
+  if (!reason || !String(reason).trim()) throw new Error("reason is required");
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const batch = await client.query(
+      `SELECT * FROM public.monthly_cost_batch WHERE batch_id = $1 FOR UPDATE`,
+      [batch_id]
+    );
+
+    if (batch.rowCount === 0) throw new Error("BATCH_NOT_FOUND");
+
+    const row = batch.rows[0];
+    const status = String(row.status || "").toUpperCase();
+
+    if (status !== "SUBMITTED") {
+      throw new Error(`BATCH_REJECT_INVALID_STATUS:${status}`);
+    }
+
+    await client.query(
+      `
+      UPDATE public.monthly_cost_batch
+      SET status = 'PM_RETURNED',
+          returned_by = $2,
+          returned_at = NOW(),
+          return_reason = $3,
+          locked_at = NULL,
+          updated_at = NOW()
+      WHERE batch_id = $1
+      `,
+      [batch_id, actor_id, String(reason).trim()]
+    );
+
+    await insertHistory(client, {
+      batch_id,
+      action: "PM_RETURNED",
+      actor_id,
+      comments: String(reason).trim(),
+    });
+
+    await client.query("COMMIT");
+    return getBatchDetail(batch_id);
+  } catch (e) {
+    await client.query("ROLLBACK");
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
 module.exports = {
   validateMonthlyCost,
   generateMonthlyCost,
+  listBatches,
+  getBatchDetail,
+  submitBatch,
+  approveBatch,
+  rejectBatch,
 };
