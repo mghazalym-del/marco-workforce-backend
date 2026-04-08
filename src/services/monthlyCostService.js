@@ -737,10 +737,28 @@ async function getBatchDetail(batch_id) {
 
   const items = await queryMany(
     `
-    SELECT *
-    FROM public.monthly_cost_batch_item
-    WHERE batch_id = $1
-    ORDER BY work_date ASC, employee_id ASC
+    SELECT
+      i.batch_item_id,
+      i.batch_id,
+      i.adjustment_run_id,
+      i.employee_id,
+      e.full_name AS employee_name,
+      i.work_date,
+      i.project_id,
+      i.option_type,
+      i.original_total_minutes,
+      i.added_or_distributed_minutes,
+      i.adjusted_total_minutes,
+
+      ROUND(COALESCE(i.original_total_minutes, 0)::numeric / 60.0, 2) AS original_hours,
+      ROUND(COALESCE(i.added_or_distributed_minutes, 0)::numeric / 60.0, 2) AS added_hours,
+      ROUND(COALESCE(i.adjusted_total_minutes, 0)::numeric / 60.0, 2) AS adjusted_hours
+
+    FROM public.monthly_cost_batch_item i
+    LEFT JOIN public.employees e
+      ON e.employee_id = i.employee_id
+    WHERE i.batch_id = $1
+    ORDER BY i.work_date ASC, i.employee_id ASC
     `,
     [batch_id]
   );
@@ -771,7 +789,10 @@ async function getBatchDetail(batch_id) {
       COUNT(*)::int AS item_count,
       COALESCE(SUM(original_total_minutes), 0)::numeric(12,2) AS original_total_minutes,
       COALESCE(SUM(added_or_distributed_minutes), 0)::numeric(12,2) AS added_or_distributed_minutes,
-      COALESCE(SUM(adjusted_total_minutes), 0)::numeric(12,2) AS adjusted_total_minutes
+      COALESCE(SUM(adjusted_total_minutes), 0)::numeric(12,2) AS adjusted_total_minutes,
+      ROUND(COALESCE(SUM(original_total_minutes), 0)::numeric / 60.0, 2) AS original_total_hours,
+      ROUND(COALESCE(SUM(added_or_distributed_minutes), 0)::numeric / 60.0, 2) AS added_total_hours,
+      ROUND(COALESCE(SUM(adjusted_total_minutes), 0)::numeric / 60.0, 2) AS adjusted_total_hours
     FROM public.monthly_cost_batch_item
     WHERE batch_id = $1
     `,
