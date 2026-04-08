@@ -120,6 +120,16 @@ router.post("/generate", requireAuth, async (req, res) => {
   } catch (err) {
     console.error("[monthly-cost][POST /generate] error:", err);
 
+    if (msg.includes("MONTH_ALREADY_APPROVED_LOCKED")) {
+      return res.status(409).json({
+      success: false,
+      error: {
+        code: "MONTH_LOCKED",
+        message: "This month is already approved and cannot be regenerated.",
+      },
+    });
+  }
+
     const msg = String(err.message || "");
 
     if (

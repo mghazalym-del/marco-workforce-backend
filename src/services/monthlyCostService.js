@@ -31,6 +31,21 @@ async function queryOne(text, params) {
   return r.rows[0] || null;
 }
 
+async function getLockedBatch({ project_id, cost_month, option_type }) {
+  return queryOne(
+    `
+    SELECT *
+    FROM public.monthly_cost_batch
+    WHERE project_id = $1
+      AND cost_month = $2
+      AND option_type = $3
+      AND status = 'PM_APPROVED'
+    LIMIT 1
+    `,
+    [project_id, cost_month, option_type]
+  );
+}
+
 function normalizeOption(option_type) {
   const option = String(option_type || "").toUpperCase();
   if (!["OPTION1", "OPTION2"].includes(option)) {
@@ -521,6 +536,17 @@ async function generateMonthlyCost({
     cost_month,
     option_type,
   });
+
+  // HARD LOCK CHECK
+  const lockedBatch = await getLockedBatch({
+    project_id: validation.project_id,
+    cost_month: validation.cost_month,
+    option_type: validation.option_type,
+  });
+
+  if (lockedBatch) {
+    throw new Error("MONTH_ALREADY_APPROVED_LOCKED");
+  }
 
   const client = await pool.connect();
 
