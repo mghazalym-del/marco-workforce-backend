@@ -721,6 +721,105 @@ async function listBatches({ project_id = null, cost_month = null, option_type =
   );
 }
 
+async function getBatchReviewRows(batch) {
+  return queryMany(
+    `
+    WITH batch_runs AS (
+      SELECT
+        i.batch_item_id,
+        i.batch_id,
+        i.adjustment_run_id,
+        i.employee_id,
+        i.work_date,
+        i.project_id,
+        i.option_type,
+        i.original_total_minutes,
+        i.added_or_distributed_minutes,
+        i.adjusted_total_minutes
+      FROM public.monthly_cost_batch_item i
+      WHERE i.batch_id = $1
+    ),
+    task_rows AS (
+      SELECT
+        br.batch_item_id,
+        br.batch_id,
+        br.adjustment_run_id,
+        br.employee_id,
+        e.full_name AS employee_name,
+        br.work_date,
+        br.project_id,
+        ts.task_id,
+        wi.item_code AS task_code,
+        wi.item_name AS task_name,
+        COALESCE(ts.duration_minutes, 0)::numeric(12,2) AS original_minutes,
+        ROW_NUMBER() OVER (
+          PARTITION BY br.adjustment_run_id
+          ORDER BY ts.start_ts NULLS FIRST, ts.created_at NULLS FIRST, ts.task_id
+        ) AS rn,
+        br.option_type,
+        br.added_or_distributed_minutes
+      FROM batch_runs br
+      LEFT JOIN public.employees e
+        ON e.employee_id = br.employee_id
+      LEFT JOIN public.task_session ts
+        ON ts.employee_id = br.employee_id
+       AND ts.work_date = br.work_date
+       AND ts.project_id = br.project_id
+      LEFT JOIN public.work_items wi
+        ON wi.work_item_id = ts.task_id
+    )
+    SELECT
+      batch_item_id,
+      batch_id,
+      adjustment_run_id,
+      employee_id,
+      employee_name,
+      work_date,
+      project_id,
+      task_id,
+      task_code,
+      task_name,
+      original_minutes,
+      CASE
+        WHEN rn = 1 THEN COALESCE(added_or_distributed_minutes, 0)
+        ELSE 0
+      END::numeric(12,2) AS added_minutes,
+      (
+        COALESCE(original_minutes, 0) +
+        CASE
+          WHEN rn = 1 THEN COALESCE(added_or_distributed_minutes, 0)
+          ELSE 0
+        END
+      )::numeric(12,2) AS adjusted_minutes,
+      ROUND(COALESCE(original_minutes, 0)::numeric / 60.0, 2) AS original_hours,
+      ROUND(
+        (
+          CASE
+            WHEN rn = 1 THEN COALESCE(added_or_distributed_minutes, 0)
+            ELSE 0
+          END
+        )::numeric / 60.0,
+        2
+      ) AS added_hours,
+      ROUND(
+        (
+          COALESCE(original_minutes, 0) +
+          CASE
+            WHEN rn = 1 THEN COALESCE(added_or_distributed_minutes, 0)
+            ELSE 0
+          END
+        )::numeric / 60.0,
+        2
+      ) AS adjusted_hours,
+      option_type AS source_option
+    FROM task_rows
+    WHERE task_id IS NOT NULL
+    ORDER BY work_date ASC, employee_id ASC, rn ASC, task_id ASC
+    `,
+    [batch.batch_id]
+  );
+}
+
 async function getBatchDetail(batch_id) {
   const batch = await queryOne(
     `
@@ -749,11 +848,9 @@ async function getBatchDetail(batch_id) {
       i.original_total_minutes,
       i.added_or_distributed_minutes,
       i.adjusted_total_minutes,
-
       ROUND(COALESCE(i.original_total_minutes, 0)::numeric / 60.0, 2) AS original_hours,
       ROUND(COALESCE(i.added_or_distributed_minutes, 0)::numeric / 60.0, 2) AS added_hours,
       ROUND(COALESCE(i.adjusted_total_minutes, 0)::numeric / 60.0, 2) AS adjusted_hours
-
     FROM public.monthly_cost_batch_item i
     LEFT JOIN public.employees e
       ON e.employee_id = i.employee_id
@@ -762,6 +859,14 @@ async function getBatchDetail(batch_id) {
     `,
     [batch_id]
   );
+
+  let review_rows = [];
+  try {
+    review_rows = await getBatchReviewRows(batch);
+  } catch (err) {
+    console.error("[monthly-cost][getBatchDetail][review_rows] warning:", err.message);
+    review_rows = [];
+  }
 
   const issues = await queryMany(
     `
@@ -803,6 +908,7 @@ async function getBatchDetail(batch_id) {
     batch,
     totals,
     items,
+    review_rows,
     issues,
     history,
   };

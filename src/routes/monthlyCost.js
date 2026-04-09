@@ -7,16 +7,15 @@ const service = require("../services/monthlyCostService");
 function requireCostAccess(req, res) {
   const role = req.user?.role;
 
-  if (!['PM', 'COST_CONTROLLER'].includes(role)) {
+  if (!["PM", "COST_CONTROLLER"].includes(role)) {
     return res.status(403).json({
       success: false,
-      error: { code: 'FORBIDDEN', message: 'Insufficient role' }
+      error: { code: "FORBIDDEN", message: "Insufficient role" },
     });
   }
 
   return null;
 }
-
 
 function employeeIdFromAuth(req) {
   const direct =
@@ -39,8 +38,8 @@ router.post("/validate", requireAuth, async (req, res) => {
   try {
     const deny = requireCostAccess(req, res);
     if (deny) return deny;
-    const actorId = employeeIdFromAuth(req);
 
+    const actorId = employeeIdFromAuth(req);
     if (!actorId) {
       return res.status(401).json({
         success: false,
@@ -87,8 +86,8 @@ router.post("/generate", requireAuth, async (req, res) => {
   try {
     const deny = requireCostAccess(req, res);
     if (deny) return deny;
-    const actorId = employeeIdFromAuth(req);
 
+    const actorId = employeeIdFromAuth(req);
     if (!actorId) {
       return res.status(401).json({
         success: false,
@@ -120,17 +119,17 @@ router.post("/generate", requireAuth, async (req, res) => {
   } catch (err) {
     console.error("[monthly-cost][POST /generate] error:", err);
 
+    const msg = String(err.message || "");
+
     if (msg.includes("MONTH_ALREADY_APPROVED_LOCKED")) {
       return res.status(409).json({
-      success: false,
-      error: {
-        code: "MONTH_LOCKED",
-        message: "This month is already approved and cannot be regenerated.",
-      },
-    });
-  }
-
-    const msg = String(err.message || "");
+        success: false,
+        error: {
+          code: "MONTH_LOCKED",
+          message: "This month is already approved and cannot be regenerated.",
+        },
+      });
+    }
 
     if (
       msg.includes("project_id is required") ||
@@ -165,6 +164,7 @@ router.get("/batches", requireAuth, async (req, res) => {
   try {
     const deny = requireCostAccess(req, res);
     if (deny) return deny;
+
     const data = await service.listBatches({
       project_id: req.query.project_id || null,
       cost_month: req.query.cost_month || null,
@@ -189,10 +189,12 @@ router.get("/batches/:batch_id", requireAuth, async (req, res) => {
   try {
     const deny = requireCostAccess(req, res);
     if (deny) return deny;
+
     const data = await service.getBatchDetail(req.params.batch_id);
     return res.json({ success: true, data });
   } catch (err) {
     console.error("[monthly-cost][GET /batches/:batch_id] error:", err);
+
     if (String(err.message || "") === "BATCH_NOT_FOUND") {
       return res.status(404).json({
         success: false,
@@ -212,7 +214,18 @@ router.get("/batches/:batch_id", requireAuth, async (req, res) => {
 
 router.post("/batches/:batch_id/submit", requireAuth, async (req, res) => {
   try {
+    const deny = requireCostAccess(req, res);
+    if (deny) return deny;
+
     const actorId = employeeIdFromAuth(req);
+
+    if (!actorId) {
+      return res.status(401).json({
+        success: false,
+        error: { code: "UNAUTHORIZED", message: "Unauthorized" },
+      });
+    }
+
     const data = await service.submitBatch({
       batch_id: req.params.batch_id,
       actor_id: actorId,
@@ -235,7 +248,7 @@ router.post("/batches/:batch_id/submit", requireAuth, async (req, res) => {
         success: false,
         error: {
           code: "BATCH_SUBMIT_INVALID_STATUS",
-          message: `Batch cannot be submitted from current status.`,
+          message: "Batch cannot be submitted from current status.",
         },
       });
     }
@@ -252,7 +265,17 @@ router.post("/batches/:batch_id/submit", requireAuth, async (req, res) => {
 
 router.post("/batches/:batch_id/approve", requireAuth, async (req, res) => {
   try {
+    const deny = requireCostAccess(req, res);
+    if (deny) return deny;
+
     const actorId = employeeIdFromAuth(req);
+    if (!actorId) {
+      return res.status(401).json({
+        success: false,
+        error: { code: "UNAUTHORIZED", message: "Unauthorized" },
+      });
+    }
+
     const { comments = null } = req.body || {};
 
     const data = await service.approveBatch({
@@ -278,7 +301,7 @@ router.post("/batches/:batch_id/approve", requireAuth, async (req, res) => {
         success: false,
         error: {
           code: "BATCH_APPROVE_INVALID_STATUS",
-          message: `Batch cannot be approved from current status.`,
+          message: "Batch cannot be approved from current status.",
         },
       });
     }
@@ -295,7 +318,17 @@ router.post("/batches/:batch_id/approve", requireAuth, async (req, res) => {
 
 router.post("/batches/:batch_id/reject", requireAuth, async (req, res) => {
   try {
+    const deny = requireCostAccess(req, res);
+    if (deny) return deny;
+
     const actorId = employeeIdFromAuth(req);
+    if (!actorId) {
+      return res.status(401).json({
+        success: false,
+        error: { code: "UNAUTHORIZED", message: "Unauthorized" },
+      });
+    }
+
     const { reason } = req.body || {};
 
     const data = await service.rejectBatch({
@@ -319,7 +352,10 @@ router.post("/batches/:batch_id/reject", requireAuth, async (req, res) => {
     if (msg === "reason is required") {
       return res.status(400).json({
         success: false,
-        error: { code: "REJECT_REASON_REQUIRED", message: "Reject reason is required." },
+        error: {
+          code: "REJECT_REASON_REQUIRED",
+          message: "Reject reason is required.",
+        },
       });
     }
 
@@ -328,7 +364,7 @@ router.post("/batches/:batch_id/reject", requireAuth, async (req, res) => {
         success: false,
         error: {
           code: "BATCH_REJECT_INVALID_STATUS",
-          message: `Batch cannot be rejected from current status.`,
+          message: "Batch cannot be rejected from current status.",
         },
       });
     }
