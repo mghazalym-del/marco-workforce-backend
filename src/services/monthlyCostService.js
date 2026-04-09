@@ -537,7 +537,6 @@ async function generateMonthlyCost({
     option_type,
   });
 
-  // HARD LOCK CHECK
   const lockedBatch = await getLockedBatch({
     project_id: validation.project_id,
     cost_month: validation.cost_month,
@@ -791,6 +790,15 @@ async function getBatchReviewRows(batch) {
           ELSE 0
         END
       )::numeric(12,2) AS adjusted_minutes,
+      (
+        (
+          COALESCE(original_minutes, 0) +
+          CASE
+            WHEN rn = 1 THEN COALESCE(added_or_distributed_minutes, 0)
+            ELSE 0
+          END
+        ) - COALESCE(original_minutes, 0)
+      )::numeric(12,2) AS difference_minutes,
       ROUND(COALESCE(original_minutes, 0)::numeric / 60.0, 2) AS original_hours,
       ROUND(
         (
@@ -811,6 +819,18 @@ async function getBatchReviewRows(batch) {
         )::numeric / 60.0,
         2
       ) AS adjusted_hours,
+      ROUND(
+        (
+          (
+            COALESCE(original_minutes, 0) +
+            CASE
+              WHEN rn = 1 THEN COALESCE(added_or_distributed_minutes, 0)
+              ELSE 0
+            END
+          ) - COALESCE(original_minutes, 0)
+        )::numeric / 60.0,
+        2
+      ) AS difference_hours,
       option_type AS source_option
     FROM task_rows
     WHERE task_id IS NOT NULL
